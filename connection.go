@@ -290,7 +290,7 @@ func (conn *Connection) handleMsg(msg connectionMsg) (terminate bool, err error)
 		conn.reader = nil
 		err = msgT.error
 	case *connectionReadMessage:
-		err = conn.handleMsgFromServer((*msgs.Message)(msgT))
+		err = conn.handleMsgFromServer((*msgs.ClientMessage)(msgT))
 	case *connectionBeater:
 		err = conn.beat()
 	case *connectionMsgShutdown:
@@ -553,7 +553,7 @@ func (cr *connectionRun) start() (bool, error) {
 	log.Printf("Connection established to %v (%v)\n", cr.serverHost, cr.rmId)
 
 	seg := capn.NewBuffer(nil)
-	message := msgs.NewRootMessage(seg)
+	message := msgs.NewRootClientMessage(seg)
 	message.SetHeartbeat()
 	buf := new(bytes.Buffer)
 	_, err := seg.WriteTo(buf)
@@ -587,7 +587,7 @@ func (cr *connectionRun) isReady(ar *connectionMsgAwaitReady) {
 	}
 }
 
-func (cr *connectionRun) sendMessage(msg *msgs.Message) error {
+func (cr *connectionRun) sendMessage(msg *msgs.ClientMessage) error {
 	if cr.currentState == cr {
 		cr.mustSendBeat = false
 		buf := new(bytes.Buffer)
@@ -599,15 +599,15 @@ func (cr *connectionRun) sendMessage(msg *msgs.Message) error {
 	return nil
 }
 
-func (cr *connectionRun) handleMsgFromServer(msg *msgs.Message) error {
+func (cr *connectionRun) handleMsgFromServer(msg *msgs.ClientMessage) error {
 	if cr.currentState != cr {
 		return nil
 	}
 	cr.missingBeats = 0
 	switch which := msg.Which(); which {
-	case msgs.MESSAGE_HEARTBEAT:
+	case msgs.CLIENTMESSAGE_HEARTBEAT:
 		// do nothing
-	case msgs.MESSAGE_CLIENTTXNOUTCOME:
+	case msgs.CLIENTMESSAGE_CLIENTTXNOUTCOME:
 		outcome := msg.ClientTxnOutcome()
 		return cr.handleTxnOutcome(&outcome)
 	default:
@@ -632,7 +632,7 @@ func (cr *connectionRun) submitTxn(txnMsg *connectionMsgTxn) error {
 	binary.BigEndian.PutUint64(cr.namespace[:8], cr.nextTxnId)
 	txnMsg.txn.SetId(cr.namespace)
 	seg := capn.NewBuffer(nil)
-	msg := msgs.NewRootMessage(seg)
+	msg := msgs.NewRootClientMessage(seg)
 	msg.SetClientTxnSubmission(*txnMsg.txn)
 	if err := cr.sendMessage(&msg); err == nil {
 		cr.liveTxn = txnMsg
@@ -784,7 +784,7 @@ func (cr *connectionReader) read() {
 			return
 		default:
 			if seg, err := cr.readAndDecryptOne(); err == nil {
-				msg := msgs.ReadRootMessage(seg)
+				msg := msgs.ReadRootClientMessage(seg)
 				if !cr.enqueueQuery((*connectionReadMessage)(&msg)) {
 					return
 				}
@@ -796,7 +796,7 @@ func (cr *connectionReader) read() {
 	}
 }
 
-type connectionReadMessage msgs.Message
+type connectionReadMessage msgs.ClientMessage
 
 func (crm *connectionReadMessage) connectionMsgWitness() {}
 
