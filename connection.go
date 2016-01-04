@@ -470,7 +470,6 @@ func (cash *connectionAwaitServerHandshake) start() (bool, error) {
 	if len(cash.clusterCertPEM) != 0 {
 		opts := x509.VerifyOptions{
 			Roots:         roots,
-			CurrentTime:   time.Now(),
 			DNSName:       "", // disable server name checking
 			Intermediates: x509.NewCertPool(),
 		}
