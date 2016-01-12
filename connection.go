@@ -26,8 +26,6 @@ type Connection struct {
 	curTxn            *Txn
 	nextVUUId         uint64
 	nextTxnId         uint64
-	serverHost        string
-	rmId              common.RMId
 	namespace         []byte
 	rootVUUId         *common.VarUUId
 	socket            net.Conn
@@ -486,17 +484,17 @@ func (cash *connectionAwaitServerHandshake) start() (bool, error) {
 	}
 
 	if seg, err := cash.readOne(); err == nil {
-		server := msgs.ReadRootHelloFromServer(seg)
-		root := server.Root()
-		if len(root.Id()) != common.KeyLen {
+		server := msgs.ReadRootHelloClientFromServer(seg)
+		rootVarUUId := server.RootId()
+		if l := len(rootVarUUId); l == 0 {
+			return false, fmt.Errorf("Cluster is not yet formed; Root object has not been created.")
+		} else if l != common.KeyLen {
 			return false, fmt.Errorf("Root object VarUUId is of wrong length!")
 		}
 		cash.lock.Lock()
-		cash.rootVUUId = common.MakeVarUUId(root.Id())
+		cash.rootVUUId = common.MakeVarUUId(rootVarUUId)
 		cash.namespace = make([]byte, common.KeyLen)
 		copy(cash.namespace[8:], server.Namespace())
-		cash.serverHost = server.LocalHost()
-		cash.rmId = common.RMId(binary.BigEndian.Uint32(cash.namespace[16:20]))
 		cash.lock.Unlock()
 		cash.nextState()
 		return false, nil
@@ -525,7 +523,7 @@ func (cr *connectionRun) init(conn *Connection) {
 }
 
 func (cr *connectionRun) start() (bool, error) {
-	log.Printf("Connection established to %v (%v)\n", cr.serverHost, cr.rmId)
+	log.Printf("Connection established to %v\n", cr.socket.RemoteAddr())
 
 	seg := capn.NewBuffer(nil)
 	message := msgs.NewRootClientMessage(seg)
