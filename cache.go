@@ -92,7 +92,7 @@ func (c *cache) updateFromTxnAbort(updates *msgs.ClientUpdate_List) []*common.Va
 }
 
 func (c *cache) updateFromDelete(vUUId *common.VarUUId, txnId *common.TxnId) {
-	if vr, found := c.m[*vUUId]; found && !vr.version.Equal(txnId) {
+	if vr, found := c.m[*vUUId]; found && vr.version.Compare(txnId) != common.EQ {
 		// fmt.Printf("%v removed from cache (req ver: %v; found ver: %v)\n", vUUId, txnId, vr.version)
 		delete(c.m, *vUUId)
 	} else if found {
@@ -106,7 +106,7 @@ func (c *cache) updateFromWrite(txnId *common.TxnId, vUUId *common.VarUUId, valu
 	vr, found := c.m[*vUUId]
 	references := make([]*common.VarUUId, refs.Len())
 	switch {
-	case found && vr.version.Equal(txnId):
+	case found && vr.version.Compare(txnId) == common.EQ:
 		log.Fatal("Divergence discovered on update of ", vUUId, ": server thinks we don't have ", txnId, " but we do!")
 		return false
 	case found:
