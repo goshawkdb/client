@@ -457,17 +457,19 @@ func (o *Object) maybeRecordRead(ignoreWritten bool) error {
 	}
 	state.read = true
 	state.curVersion = valueRef.version
-	state.curValue = make([]byte, len(valueRef.value))
-	copy(state.curValue, valueRef.value)
-	refs := make([]*Object, len(valueRef.references))
-	var err error
-	for idx, vUUId := range valueRef.references {
-		refs[idx], err = state.txn.GetObject(vUUId)
-		if err != nil {
-			return err
+	if !state.write {
+		state.curValue = make([]byte, len(valueRef.value))
+		copy(state.curValue, valueRef.value)
+		refs := make([]*Object, len(valueRef.references))
+		var err error
+		for idx, vUUId := range valueRef.references {
+			refs[idx], err = state.txn.GetObject(vUUId)
+			if err != nil {
+				return err
+			}
 		}
+		state.curObjectRefs = refs
 	}
-	state.curObjectRefs = refs
 	return nil
 }
 
