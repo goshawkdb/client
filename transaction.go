@@ -450,7 +450,7 @@ func (o *Object) maybeRecordRead(ignoreWritten bool) error {
 		}
 		valueRef = state.txn.cache.Get(o.Id)
 		if valueRef == nil {
-			return fmt.Errorf("Loading var failed to find value / update cache", o.Id)
+			return fmt.Errorf("Loading var %v failed to find value / update cache", o.Id)
 		}
 		// log.Println(o.state.txn, "load", o.Id, "->", valueRef.version, modifiedVars)
 		state.txn.stats.Loads[*o.Id] = elapsed
