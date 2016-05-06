@@ -434,27 +434,30 @@ func (o *objectState) clone(txn *Txn) *objectState {
 	}
 }
 
-func (o *Object) maybeRecordRead() error {
+func (o *Object) maybeRecordRead(ignoreWritten bool) error {
 	state := o.state
-	if !(state.create || state.write || state.read) {
-		valueRef := state.txn.cache.Get(o.Id)
-		if valueRef == nil {
-			modifiedVars, elapsed, err := loadVar(o.Id, o.conn)
-			if err != nil {
-				return err
-			}
-			if state.txn.varsUpdated(modifiedVars) {
-				return Restart
-			}
-			valueRef = state.txn.cache.Get(o.Id)
-			if valueRef == nil {
-				return fmt.Errorf("Loading var failed to find value / update cache", o.Id)
-			}
-			// log.Println(o.state.txn, "load", o.Id, "->", valueRef.version, modifiedVars)
-			state.txn.stats.Loads[*o.Id] = elapsed
+	if state.create || state.read || (state.write && !ignoreWritten) {
+		return nil
+	}
+	valueRef := state.txn.cache.Get(o.Id)
+	if valueRef == nil {
+		modifiedVars, elapsed, err := loadVar(o.Id, o.conn)
+		if err != nil {
+			return err
 		}
-		state.read = true
-		state.curVersion = valueRef.version
+		if state.txn.varsUpdated(modifiedVars) {
+			return Restart
+		}
+		valueRef = state.txn.cache.Get(o.Id)
+		if valueRef == nil {
+			return fmt.Errorf("Loading var %v failed to find value / update cache", o.Id)
+		}
+		// log.Println(o.state.txn, "load", o.Id, "->", valueRef.version, modifiedVars)
+		state.txn.stats.Loads[*o.Id] = elapsed
+	}
+	state.read = true
+	state.curVersion = valueRef.version
+	if !state.write {
 		state.curValue = make([]byte, len(valueRef.value))
 		copy(state.curValue, valueRef.value)
 		refs := make([]*Object, len(valueRef.references))
@@ -477,7 +480,7 @@ func (o *Object) Value() ([]byte, error) {
 	if err := o.checkExpired(); err != nil {
 		return nil, err
 	}
-	if err := o.maybeRecordRead(); err != nil {
+	if err := o.maybeRecordRead(false); err != nil {
 		return nil, err
 	}
 	return o.state.curValue, nil
@@ -493,7 +496,7 @@ func (o *Object) Version() (*common.TxnId, error) {
 	if o.state.create {
 		return nil, nil
 	}
-	if err := o.maybeRecordRead(); err != nil {
+	if err := o.maybeRecordRead(true); err != nil {
 		return nil, err
 	}
 	return o.state.curVersion, nil
@@ -506,7 +509,7 @@ func (o *Object) References() ([]*Object, error) {
 	if err := o.checkExpired(); err != nil {
 		return nil, err
 	}
-	if err := o.maybeRecordRead(); err != nil {
+	if err := o.maybeRecordRead(false); err != nil {
 		return nil, err
 	}
 	return o.state.curObjectRefs, nil
