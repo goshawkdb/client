@@ -421,7 +421,6 @@ func (cah *connectionAwaitHandshake) send(msg []byte) error {
 			return err
 		}
 		if w != l {
-			fmt.Print("!")
 			msg = msg[w:]
 			l -= w
 		}
