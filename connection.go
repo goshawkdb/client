@@ -420,7 +420,9 @@ func (cah *connectionAwaitHandshake) send(msg []byte) error {
 		if err != nil {
 			return err
 		}
-		if w != l {
+		if w == l {
+			return nil
+		} else {
 			msg = msg[w:]
 			l -= w
 		}
