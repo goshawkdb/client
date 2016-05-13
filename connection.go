@@ -74,10 +74,7 @@ func NewConnection(hostPort string, clientCertAndKeyPEM, clusterCertPEM []byte) 
 	if err != nil {
 		return nil, err
 	}
-	if err = socket.SetKeepAlive(true); err != nil {
-		return nil, err
-	}
-	if err = socket.SetKeepAlivePeriod(time.Second); err != nil {
+	if err = common.ConfigureSocket(socket); err != nil {
 		return nil, err
 	}
 
@@ -417,8 +414,19 @@ func (cah *connectionAwaitHandshake) verifyHello(hello *msgs.Hello) bool {
 }
 
 func (cah *connectionAwaitHandshake) send(msg []byte) error {
-	_, err := cah.socket.Write(msg)
-	return err
+	l := len(msg)
+	for l > 0 {
+		w, err := cah.socket.Write(msg)
+		if err != nil {
+			return err
+		}
+		if w != l {
+			fmt.Print("!")
+			msg = msg[w:]
+			l -= w
+		}
+	}
+	return nil
 }
 
 func (cah *connectionAwaitHandshake) readOne() (*capn.Segment, error) {
