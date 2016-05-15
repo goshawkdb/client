@@ -416,13 +416,12 @@ func (cah *connectionAwaitHandshake) verifyHello(hello *msgs.Hello) bool {
 func (cah *connectionAwaitHandshake) send(msg []byte) error {
 	l := len(msg)
 	for l > 0 {
-		w, err := cah.socket.Write(msg)
-		if err != nil {
+		switch w, err := cah.socket.Write(msg); {
+		case err != nil:
 			return err
-		}
-		if w == l {
+		case w == l:
 			return nil
-		} else {
+		default:
 			msg = msg[w:]
 			l -= w
 		}
@@ -468,6 +467,9 @@ func (cash *connectionAwaitServerHandshake) start() (bool, error) {
 	}
 
 	socket := tls.Client(cash.socket, config)
+	if err := socket.SetDeadline(time.Time{}); err != nil {
+		return false, err
+	}
 	cash.socket = socket
 
 	if err := socket.Handshake(); err != nil {
