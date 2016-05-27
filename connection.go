@@ -603,13 +603,13 @@ func (cr *connectionRun) handleMsgFromServer(msg *msgs.ClientMessage) error {
 func (cr *connectionRun) submitTxn(txnMsg *connectionMsgTxn) error {
 	if cr.currentState != cr {
 		if !txnMsg.setOutcomeError(nil, nil, fmt.Errorf("Connection in wrong state: %v", cr.currentState)) {
-			return fmt.Errorf("Live txn already closed")
+			return fmt.Errorf("Connection in wrong state: %v", cr.currentState)
 		}
 		return nil
 	}
 	if cr.liveTxn != nil {
 		if !txnMsg.setOutcomeError(nil, nil, fmt.Errorf("Existing live txn")) {
-			return fmt.Errorf("Live txn already closed")
+			return fmt.Errorf("Existing live txn")
 		}
 		return nil
 	}
