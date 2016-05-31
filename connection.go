@@ -163,27 +163,29 @@ func (conn *Connection) nextVarUUId() *common.VarUUId {
 }
 
 type connectionMsg interface {
-	connectionMsgWitness()
+	witness() connectionMsg
 }
 
-type connectionMsgShutdown struct{}
+type connectionMsgBasic struct{}
 
-func (cms *connectionMsgShutdown) connectionMsgWitness() {}
-func (cms *connectionMsgShutdown) Error() string {
+func (cmb connectionMsgBasic) witness() connectionMsg { return cmb }
+
+type connectionMsgShutdown struct{ connectionMsgBasic }
+
+func (cms connectionMsgShutdown) Error() string {
 	return "Connection Shutdown"
 }
-
-var connectionMsgShutdownInst = &connectionMsgShutdown{}
 
 // Shutdown the connection. This will block until the connection is
 // closed.
 func (conn *Connection) Shutdown() {
-	if conn.enqueueQuery(connectionMsgShutdownInst) {
+	if conn.enqueueQuery(connectionMsgShutdown{}) {
 		conn.cellTail.Wait()
 	}
 }
 
 type connectionMsgSyncQuery struct {
+	connectionMsgBasic
 	resultChan chan struct{}
 	err        error
 }
@@ -192,14 +194,12 @@ func (cmsq *connectionMsgSyncQuery) init() {
 	cmsq.resultChan = make(chan struct{})
 }
 
-type connectionMsgAwaitReady connectionMsgSyncQuery
-
-func (cmwr *connectionMsgAwaitReady) connectionMsgWitness() {}
+type connectionMsgAwaitReady struct{ connectionMsgSyncQuery }
 
 func (conn *Connection) awaitReady() error {
-	query := new(connectionMsgSyncQuery)
+	query := &connectionMsgAwaitReady{}
 	query.init()
-	if conn.enqueueSyncQuery((*connectionMsgAwaitReady)(query), query.resultChan) {
+	if conn.enqueueSyncQuery(query, query.resultChan) {
 		return query.err
 	} else {
 		return nil
@@ -212,8 +212,6 @@ type connectionMsgTxn struct {
 	outcome      *msgs.ClientTxnOutcome
 	modifiedVars []*common.VarUUId
 }
-
-func (cmt *connectionMsgTxn) connectionMsgWitness() {}
 
 func (cmt *connectionMsgTxn) setOutcomeError(outcome *msgs.ClientTxnOutcome, modifiedVars []*common.VarUUId, err error) bool {
 	select {
@@ -234,7 +232,7 @@ func (conn *Connection) submitTransaction(txn *msgs.ClientTxn) (*msgs.ClientTxnO
 	if conn.enqueueSyncQuery(query, query.resultChan) {
 		return query.outcome, query.modifiedVars, query.err
 	} else {
-		return nil, nil, connectionMsgShutdownInst
+		return nil, nil, connectionMsgShutdown{}
 	}
 }
 
@@ -295,14 +293,14 @@ func (conn *Connection) handleMsg(msg connectionMsg) (terminate bool, err error)
 	switch msgT := msg.(type) {
 	case *connectionMsgTxn:
 		err = conn.submitTxn(msgT)
-	case *connectionReadError:
+	case connectionReadMessage:
+		err = conn.handleMsgFromServer((msgs.ClientMessage)(msgT))
+	case connectionReadError:
 		conn.reader = nil
 		err = msgT.error
-	case *connectionReadMessage:
-		err = conn.handleMsgFromServer((*msgs.ClientMessage)(msgT))
 	case *connectionBeater:
 		err = conn.beat()
-	case *connectionMsgShutdown:
+	case connectionMsgShutdown:
 		terminate = true
 		conn.currentState = nil
 	case *connectionMsgAwaitReady:
@@ -322,7 +320,7 @@ func (conn *Connection) handleShutdown(err error) {
 	e := fmt.Errorf("Connection shutting down")
 	if conn.liveTxn != nil {
 		if !conn.liveTxn.setOutcomeError(nil, nil, e) {
-			log.Println("Internal Logic Failure when closing outstanding live txn")
+			panic("Internal Logic Failure when closing outstanding live txn")
 		}
 		conn.liveTxn = nil
 	}
@@ -355,8 +353,6 @@ func (conn *Connection) nextState() {
 		conn.currentState = &conn.connectionAwaitServerHandshake
 	case &conn.connectionAwaitServerHandshake:
 		conn.currentState = &conn.connectionRun
-	case &conn.connectionRun:
-		conn.currentState = nil
 	}
 }
 
@@ -583,7 +579,7 @@ func (cr *connectionRun) sendMessage(msg *msgs.ClientMessage) error {
 	return nil
 }
 
-func (cr *connectionRun) handleMsgFromServer(msg *msgs.ClientMessage) error {
+func (cr *connectionRun) handleMsgFromServer(msg msgs.ClientMessage) error {
 	if cr.currentState != cr {
 		return nil
 	}
@@ -592,8 +588,7 @@ func (cr *connectionRun) handleMsgFromServer(msg *msgs.ClientMessage) error {
 	case msgs.CLIENTMESSAGE_HEARTBEAT:
 		// do nothing
 	case msgs.CLIENTMESSAGE_CLIENTTXNOUTCOME:
-		outcome := msg.ClientTxnOutcome()
-		return cr.handleTxnOutcome(&outcome)
+		return cr.handleTxnOutcome(msg.ClientTxnOutcome())
 	default:
 		return fmt.Errorf("Received unexpected message from server: %v", which)
 	}
@@ -627,7 +622,7 @@ func (cr *connectionRun) submitTxn(txnMsg *connectionMsgTxn) error {
 	}
 }
 
-func (cr *connectionRun) handleTxnOutcome(outcome *msgs.ClientTxnOutcome) error {
+func (cr *connectionRun) handleTxnOutcome(outcome msgs.ClientTxnOutcome) error {
 	txnId := common.MakeTxnId(outcome.Id())
 	if cr.liveTxn == nil {
 		return fmt.Errorf("Received txn outcome for unknown txn: %v", txnId)
@@ -652,7 +647,7 @@ func (cr *connectionRun) handleTxnOutcome(outcome *msgs.ClientTxnOutcome) error 
 	case msgs.CLIENTTXNOUTCOME_ERROR:
 		err = fmt.Errorf(outcome.Error())
 	}
-	if !cr.liveTxn.setOutcomeError(outcome, modifiedVars, err) {
+	if !cr.liveTxn.setOutcomeError(&outcome, modifiedVars, err) {
 		return fmt.Errorf("Live txn already closed")
 	}
 	cr.liveTxn = nil
@@ -686,18 +681,11 @@ func (cr *connectionRun) maybeStopBeater() {
 func (cr *connectionRun) maybeStopReaderAndCloseSocket() {
 	if cr.reader != nil {
 		close(cr.reader.terminate)
-		if cr.socket != nil {
-			if err := cr.socket.Close(); err != nil {
-				log.Println(err)
-			}
-		}
 		cr.reader.terminated.Wait()
 		cr.reader = nil
-		cr.socket = nil
-	} else if cr.socket != nil {
-		if err := cr.socket.Close(); err != nil {
-			log.Println(err)
-		}
+	}
+	if cr.socket != nil {
+		cr.socket.Close()
 		cr.socket = nil
 	}
 }
@@ -740,7 +728,7 @@ func (cb *connectionBeater) beat() {
 	}
 }
 
-func (cb *connectionBeater) connectionMsgWitness() {}
+func (cb *connectionBeater) witness() connectionMsg { return cb }
 
 // Reader
 
@@ -769,11 +757,11 @@ func (cr *connectionReader) read() {
 		default:
 			if seg, err := cr.readOne(); err == nil {
 				msg := msgs.ReadRootClientMessage(seg)
-				if !cr.enqueueQuery((*connectionReadMessage)(&msg)) {
+				if !cr.enqueueQuery(connectionReadMessage(msg)) {
 					return
 				}
 			} else {
-				cr.enqueueQuery(&connectionReadError{err})
+				cr.enqueueQuery(connectionReadError{err})
 				return
 			}
 		}
@@ -782,10 +770,10 @@ func (cr *connectionReader) read() {
 
 type connectionReadMessage msgs.ClientMessage
 
-func (crm *connectionReadMessage) connectionMsgWitness() {}
+func (crm connectionReadMessage) witness() connectionMsg { return crm }
 
 type connectionReadError struct {
 	error
 }
 
-func (cre *connectionReadError) connectionMsgWitness() {}
+func (cre connectionReadError) witness() connectionMsg { return cre }

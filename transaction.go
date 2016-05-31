@@ -327,7 +327,9 @@ func (txn *Txn) GetRootObject() (*Object, error) {
 
 // Create a new object and set its value and references. If an error
 // is returned, the current transaction should immediately be
-// restarted (return the error Restart)
+// restarted (return the error Restart). This method takes copies of
+// both the value and the references so if you modify either after
+// calling this method, your modifications will not take effect.
 func (txn *Txn) CreateObject(value []byte, references ...*Object) (*Object, error) {
 	if txn.resetInProgress {
 		return nil, Restart
@@ -342,10 +344,13 @@ func (txn *Txn) CreateObject(value []byte, references ...*Object) (*Object, erro
 		Object:        obj,
 		parentState:   nil,
 		txn:           txn,
-		curValue:      value,
-		curObjectRefs: references,
+		curValue:      make([]byte, len(value)),
+		curObjectRefs: make([]*Object, len(references)),
 		create:        true,
 	}
+	copy(state.curValue, value)
+	copy(state.curObjectRefs, references)
+
 	obj.state = state
 	return obj, nil
 }
@@ -458,8 +463,7 @@ func (o *Object) maybeRecordRead(ignoreWritten bool) error {
 	state.read = true
 	state.curVersion = valueRef.version
 	if !state.write {
-		state.curValue = make([]byte, len(valueRef.value))
-		copy(state.curValue, valueRef.value)
+		state.curValue = valueRef.value
 		refs := make([]*Object, len(valueRef.references))
 		var err error
 		for idx, vUUId := range valueRef.references {
@@ -471,19 +475,6 @@ func (o *Object) maybeRecordRead(ignoreWritten bool) error {
 		state.curObjectRefs = refs
 	}
 	return nil
-}
-
-// Returns the current value of this object. If an error is returned,
-// the current transaction should immediately be restarted (return the
-// error Restart)
-func (o *Object) Value() ([]byte, error) {
-	if err := o.checkExpired(); err != nil {
-		return nil, err
-	}
-	if err := o.maybeRecordRead(false); err != nil {
-		return nil, err
-	}
-	return o.state.curValue, nil
 }
 
 // Returns the TxnId of the last transaction that wrote to this
@@ -502,9 +493,28 @@ func (o *Object) Version() (*common.TxnId, error) {
 	return o.state.curVersion, nil
 }
 
-// Returns the list of Objects to which the current object refers. If
-// an error is returned, the current transaction should immediately be
-// restarted (return the error Restart)
+// Returns the current value of this object. If an error is returned,
+// the current transaction should immediately be restarted (return the
+// error Restart). Returns a copy of the current value so you are safe
+// to modify it but you will need to call the Set method for any
+// modifications to take effect.
+func (o *Object) Value() ([]byte, error) {
+	if err := o.checkExpired(); err != nil {
+		return nil, err
+	}
+	if err := o.maybeRecordRead(false); err != nil {
+		return nil, err
+	}
+	c := make([]byte, len(o.state.curValue))
+	copy(c, o.state.curValue)
+	return c, nil
+}
+
+// Returns the list of Objects to which this object refers. If an
+// error is returned, the current transaction should immediately be
+// restarted (return the error Restart). Returns a copy of the current
+// references so you are safe to modify it, but you will need to call
+// the Set method for any modifications to take effect.
 func (o *Object) References() ([]*Object, error) {
 	if err := o.checkExpired(); err != nil {
 		return nil, err
@@ -512,7 +522,29 @@ func (o *Object) References() ([]*Object, error) {
 	if err := o.maybeRecordRead(false); err != nil {
 		return nil, err
 	}
-	return o.state.curObjectRefs, nil
+	c := make([]*Object, len(o.state.curObjectRefs))
+	copy(c, o.state.curObjectRefs)
+	return c, nil
+}
+
+// Returns the current value of this object the list of Objects to
+// which this object refers. If an error is returned, the current
+// transaction should immediately be restarted (return the error
+// Restart). Returns a copy of the current value and a copy of the
+// current references so you are safe to modify them but you will need
+// to call the Set method for any modifications to take effect.
+func (o *Object) ValueReferences() ([]byte, []*Object, error) {
+	if err := o.checkExpired(); err != nil {
+		return nil, nil, err
+	}
+	if err := o.maybeRecordRead(false); err != nil {
+		return nil, nil, err
+	}
+	vc := make([]byte, len(o.state.curValue))
+	copy(vc, o.state.curValue)
+	rc := make([]*Object, len(o.state.curObjectRefs))
+	copy(rc, o.state.curObjectRefs)
+	return vc, rc, nil
 }
 
 // Sets the value and references of the current object. If the value
@@ -520,16 +552,19 @@ func (o *Object) References() ([]*Object, error) {
 // declared as references otherwise on retrieval you will not be able
 // to navigate to them. Note that the order of references is
 // stable. If an error is returned, the current transaction should
-// immediately be restarted (return the error Restart)
+// immediately be restarted (return the error Restart). This method
+// takes copies of both the value and the references so if you modify
+// either after calling this method, your modifications will not take
+// effect.
 func (o *Object) Set(value []byte, references ...*Object) error {
 	if err := o.checkExpired(); err != nil {
 		return err
 	}
 	o.state.write = true
-	valCpy := make([]byte, len(value))
-	copy(valCpy, value)
-	o.state.curValue = valCpy
-	o.state.curObjectRefs = references
+	o.state.curValue = make([]byte, len(value))
+	copy(o.state.curValue, value)
+	o.state.curObjectRefs = make([]*Object, len(references))
+	copy(o.state.curObjectRefs, references)
 	return nil
 }
 
