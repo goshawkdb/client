@@ -363,6 +363,7 @@ type connectionAwaitHandshake struct {
 }
 
 func (cah *connectionAwaitHandshake) connectionStateMachineComponentWitness() {}
+func (cah *connectionAwaitHandshake) String() string                          { return "ConnectionAwaitHandshake" }
 
 func (cah *connectionAwaitHandshake) init(conn *Connection) {
 	cah.Connection = conn
@@ -525,6 +526,8 @@ type connectionRun struct {
 }
 
 func (cr *connectionRun) connectionStateMachineComponentWitness() {}
+func (cr *connectionRun) String() string                          { return "ConnectionRun" }
+
 func (cr *connectionRun) init(conn *Connection) {
 	cr.Connection = conn
 }
