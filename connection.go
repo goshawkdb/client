@@ -27,7 +27,7 @@ type Connection struct {
 	nextVUUId         uint64
 	nextTxnId         uint64
 	namespace         []byte
-	rootVUUId         *common.VarUUId
+	rootVUUIds        map[string]*common.VarUUId
 	socket            net.Conn
 	cache             *cache
 	cellTail          *cc.ChanCellTail
@@ -131,13 +131,13 @@ func NewConnection(hostPort string, clientCertAndKeyPEM, clusterCertPEM []byte) 
 // transactions: it is perfectly safe and expected to call
 // RunTransaction from within a transaction.
 func (conn *Connection) RunTransaction(fun func(*Txn) (interface{}, error)) (interface{}, *Stats, error) {
-	root := conn.rootVarUUId()
-	if root == nil {
-		return nil, nil, fmt.Errorf("Unable to start transaction: root object not ready")
+	roots := conn.rootVarUUIds()
+	if roots == nil {
+		return nil, nil, fmt.Errorf("Unable to start transaction: root objects not ready")
 	}
 	var oldTxn *Txn
 	conn.lock.Lock()
-	txn := newTxn(fun, conn, conn.cache, root, conn.curTxn)
+	txn := newTxn(fun, conn, conn.cache, roots, conn.curTxn)
 	conn.curTxn, oldTxn = txn, conn.curTxn
 	conn.lock.Unlock()
 	res, stats, err := txn.run()
@@ -147,10 +147,10 @@ func (conn *Connection) RunTransaction(fun func(*Txn) (interface{}, error)) (int
 	return res, stats, err
 }
 
-func (conn *Connection) rootVarUUId() *common.VarUUId {
+func (conn *Connection) rootVarUUIds() map[string]*common.VarUUId {
 	conn.lock.RLock()
 	defer conn.lock.RUnlock()
-	return conn.rootVUUId
+	return conn.rootVUUIds
 }
 
 func (conn *Connection) nextVarUUId() *common.VarUUId {
@@ -386,7 +386,16 @@ func (cah *connectionAwaitHandshake) start() (bool, error) {
 		if hello := msgs.ReadRootHello(seg); cah.verifyHello(&hello) {
 			cah.nextState()
 		} else {
-			return false, fmt.Errorf("Received erroneous hello from server")
+			product := hello.Product()
+			if l := len(common.ProductName); len(product) > l {
+				product = product[:l] + "..."
+			}
+			version := hello.Version()
+			if l := len(common.ProductVersion); len(version) > l {
+				version = version[:l] + "..."
+			}
+			return false, fmt.Errorf("Received erroneous hello from peer: received product name '%s' (expected '%s'), product version '%s' (expected '%s')",
+				product, common.ProductName, version, common.ProductVersion)
 		}
 	} else {
 		return false, err
@@ -493,14 +502,18 @@ func (cash *connectionAwaitServerHandshake) start() (bool, error) {
 
 	if seg, err := cash.readOne(); err == nil {
 		server := msgs.ReadRootHelloClientFromServer(seg)
-		rootVarUUId := server.RootId()
-		if l := len(rootVarUUId); l == 0 {
-			return false, fmt.Errorf("Cluster is not yet formed; Root object has not been created.")
-		} else if l != common.KeyLen {
-			return false, fmt.Errorf("Root object VarUUId is of wrong length!")
+		rootsCap := server.Roots()
+		l := rootsCap.Len()
+		if l == 0 {
+			return false, fmt.Errorf("Cluster is not yet formed; Root objects have not been created.")
+		}
+		roots := make(map[string]*common.VarUUId, l)
+		for idx := 0; idx < l; idx++ {
+			rootCap := rootsCap.At(idx)
+			roots[rootCap.Name()] = common.MakeVarUUId(rootCap.VarId())
 		}
 		cash.lock.Lock()
-		cash.rootVUUId = common.MakeVarUUId(rootVarUUId)
+		cash.rootVUUIds = roots
 		cash.namespace = make([]byte, common.KeyLen)
 		copy(cash.namespace[8:], server.Namespace())
 		cash.lock.Unlock()

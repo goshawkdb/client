@@ -16,7 +16,7 @@ type Txn struct {
 	conn            *Connection
 	cache           *cache
 	parent          *Txn
-	root            *common.VarUUId
+	roots           map[string]*common.VarUUId
 	objs            map[common.VarUUId]*Object
 	resetInProgress bool
 	stats           *Stats
@@ -64,13 +64,13 @@ func (tfr TxnFunResult) Error() string {
 	}
 }
 
-func newTxn(fun func(*Txn) (interface{}, error), conn *Connection, cache *cache, root *common.VarUUId, parent *Txn) *Txn {
+func newTxn(fun func(*Txn) (interface{}, error), conn *Connection, cache *cache, roots map[string]*common.VarUUId, parent *Txn) *Txn {
 	t := &Txn{
 		fun:    fun,
 		conn:   conn,
 		cache:  cache,
 		parent: parent,
-		root:   root,
+		roots:  roots,
 		objs:   make(map[common.VarUUId]*Object),
 	}
 	if parent == nil {
@@ -316,13 +316,22 @@ func (txn *Txn) submitToServer() (bool, error) {
 	return outcome.Which() == msgs.CLIENTTXNOUTCOME_ABORT, nil
 }
 
-// Returns the database Root Object. The Root Object is known to all
-// clients and represents the root of the object graph. For an object
-// to be reachable, there must be a path to it from the Root
-// Object. If an error is returned, the current transaction should
-// immediately be restarted (return the error Restart)
-func (txn *Txn) GetRootObject() (*Object, error) {
-	return txn.GetObject(txn.root)
+// Returns the database Root Objects. The Root Objects for each client
+// are defined by the cluster configuration represent the roots of the
+// object graphs. For an object to be reachable, there must be a path
+// to it from a Root Object. If an error is returned, the current
+// transaction should immediately be restarted (return the error
+// Restart)
+func (txn *Txn) GetRootObjects() (map[string]*Object, error) {
+	roots := make(map[string]*Object, len(txn.roots))
+	for name, vUUId := range txn.roots {
+		if obj, err := txn.GetObject(vUUId); err == nil {
+			roots[name] = obj
+		} else {
+			return nil, err
+		}
+	}
+	return roots, nil
 }
 
 // Create a new object and set its value and references. If an error
