@@ -27,7 +27,7 @@ type Connection struct {
 	nextVUUId         uint64
 	nextTxnId         uint64
 	namespace         []byte
-	rootVUUIds        map[string]*common.VarUUId
+	rootVUUIds        map[string]*refCap
 	socket            net.Conn
 	cache             *cache
 	cellTail          *cc.ChanCellTail
@@ -147,7 +147,7 @@ func (conn *Connection) RunTransaction(fun func(*Txn) (interface{}, error)) (int
 	return res, stats, err
 }
 
-func (conn *Connection) rootVarUUIds() map[string]*common.VarUUId {
+func (conn *Connection) rootVarUUIds() map[string]*refCap {
 	conn.lock.RLock()
 	defer conn.lock.RUnlock()
 	return conn.rootVUUIds
@@ -507,10 +507,13 @@ func (cash *connectionAwaitServerHandshake) start() (bool, error) {
 		if l == 0 {
 			return false, fmt.Errorf("Cluster is not yet formed; Root objects have not been created.")
 		}
-		roots := make(map[string]*common.VarUUId, l)
+		roots := make(map[string]*refCap, l)
 		for idx := 0; idx < l; idx++ {
 			rootCap := rootsCap.At(idx)
-			roots[rootCap.Name()] = common.MakeVarUUId(rootCap.VarId())
+			roots[rootCap.Name()] = &refCap{
+				vUUId:        common.MakeVarUUId(rootCap.VarId()),
+				capabilities: rootCap.Capabilities(),
+			}
 		}
 		cash.lock.Lock()
 		cash.rootVUUIds = roots

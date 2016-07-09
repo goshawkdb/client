@@ -16,7 +16,7 @@ type Txn struct {
 	conn            *Connection
 	cache           *cache
 	parent          *Txn
-	roots           map[string]*common.VarUUId
+	roots           map[string]*refCap
 	objs            map[common.VarUUId]*Object
 	resetInProgress bool
 	stats           *Stats
@@ -64,7 +64,7 @@ func (tfr TxnFunResult) Error() string {
 	}
 }
 
-func newTxn(fun func(*Txn) (interface{}, error), conn *Connection, cache *cache, roots map[string]*common.VarUUId, parent *Txn) *Txn {
+func newTxn(fun func(*Txn) (interface{}, error), conn *Connection, cache *cache, roots map[string]*refCap, parent *Txn) *Txn {
 	t := &Txn{
 		fun:    fun,
 		conn:   conn,
@@ -283,9 +283,11 @@ func (txn *Txn) submitToServer() (bool, error) {
 			action.SetRead()
 			action.Read().SetVersion(state.curVersion[:])
 		} else {
-			refs := seg.NewDataList(len(state.curObjectRefs))
-			for idy, ref := range state.curObjectRefs {
-				refs.Set(idy, ref.Id[:])
+			refs := msgs.NewClientVarIdPosList(seg, len(state.curObjectRefs))
+			for idy, ocp := range state.curObjectRefs {
+				ref := refs.At(idy)
+				ref.SetVarId(ocp.object.Id[:])
+				ref.SetCapabilities(ocp.capabilities)
 			}
 			switch {
 			case idx < readwriteThresh:
@@ -322,11 +324,14 @@ func (txn *Txn) submitToServer() (bool, error) {
 // to it from a Root Object. If an error is returned, the current
 // transaction should immediately be restarted (return the error
 // Restart)
-func (txn *Txn) GetRootObjects() (map[string]*Object, error) {
-	roots := make(map[string]*Object, len(txn.roots))
-	for name, vUUId := range txn.roots {
-		if obj, err := txn.GetObject(vUUId); err == nil {
-			roots[name] = obj
+func (txn *Txn) GetRootObjects() (map[string]ObjectCapabilityPair, error) {
+	roots := make(map[string]ObjectCapabilityPair, len(txn.roots))
+	for name, rc := range txn.roots {
+		if obj, err := txn.GetObject(rc.vUUId); err == nil {
+			roots[name] = ObjectCapabilityPair{
+				object:       obj,
+				capabilities: rc.capabilities,
+			}
 		} else {
 			return nil, err
 		}
@@ -339,7 +344,7 @@ func (txn *Txn) GetRootObjects() (map[string]*Object, error) {
 // restarted (return the error Restart). This method takes copies of
 // both the value and the references so if you modify either after
 // calling this method, your modifications will not take effect.
-func (txn *Txn) CreateObject(value []byte, references ...*Object) (*Object, error) {
+func (txn *Txn) CreateObject(value []byte, references ...ObjectCapabilityPair) (*Object, error) {
 	if txn.resetInProgress {
 		return nil, Restart
 	}
@@ -354,7 +359,7 @@ func (txn *Txn) CreateObject(value []byte, references ...*Object) (*Object, erro
 		parentState:   nil,
 		txn:           txn,
 		curValue:      make([]byte, len(value)),
-		curObjectRefs: make([]*Object, len(references)),
+		curObjectRefs: make([]ObjectCapabilityPair, len(references)),
 		create:        true,
 	}
 	copy(state.curValue, value)
@@ -422,13 +427,18 @@ type Object struct {
 	state *objectState
 }
 
+type ObjectCapabilityPair struct {
+	object       *Object
+	capabilities msgs.Capabilities
+}
+
 type objectState struct {
 	*Object
 	parentState   *objectState
 	txn           *Txn
 	curVersion    *common.TxnId
 	curValue      []byte
-	curObjectRefs []*Object
+	curObjectRefs []ObjectCapabilityPair
 	read          bool
 	write         bool
 	create        bool
@@ -473,12 +483,16 @@ func (o *Object) maybeRecordRead(ignoreWritten bool) error {
 	state.curVersion = valueRef.version
 	if !state.write {
 		state.curValue = valueRef.value
-		refs := make([]*Object, len(valueRef.references))
+		refs := make([]ObjectCapabilityPair, len(valueRef.references))
 		var err error
-		for idx, vUUId := range valueRef.references {
-			refs[idx], err = state.txn.GetObject(vUUId)
-			if err != nil {
-				return err
+		for idx, rc := range valueRef.references {
+			if rc.vUUId != nil {
+				ocp := &refs[idx]
+				ocp.capabilities = rc.capabilities
+				ocp.object, err = state.txn.GetObject(rc.vUUId)
+				if err != nil {
+					return err
+				}
 			}
 		}
 		state.curObjectRefs = refs
@@ -524,16 +538,16 @@ func (o *Object) Value() ([]byte, error) {
 // restarted (return the error Restart). Returns a copy of the current
 // references so you are safe to modify it, but you will need to call
 // the Set method for any modifications to take effect.
-func (o *Object) References() ([]*Object, error) {
+func (o *Object) References() ([]ObjectCapabilityPair, error) {
 	if err := o.checkExpired(); err != nil {
 		return nil, err
 	}
 	if err := o.maybeRecordRead(false); err != nil {
 		return nil, err
 	}
-	c := make([]*Object, len(o.state.curObjectRefs))
-	copy(c, o.state.curObjectRefs)
-	return c, nil
+	rc := make([]ObjectCapabilityPair, len(o.state.curObjectRefs))
+	copy(rc, o.state.curObjectRefs)
+	return rc, nil
 }
 
 // Returns the current value of this object the list of Objects to
@@ -542,7 +556,7 @@ func (o *Object) References() ([]*Object, error) {
 // Restart). Returns a copy of the current value and a copy of the
 // current references so you are safe to modify them but you will need
 // to call the Set method for any modifications to take effect.
-func (o *Object) ValueReferences() ([]byte, []*Object, error) {
+func (o *Object) ValueReferences() ([]byte, []ObjectCapabilityPair, error) {
 	if err := o.checkExpired(); err != nil {
 		return nil, nil, err
 	}
@@ -551,7 +565,7 @@ func (o *Object) ValueReferences() ([]byte, []*Object, error) {
 	}
 	vc := make([]byte, len(o.state.curValue))
 	copy(vc, o.state.curValue)
-	rc := make([]*Object, len(o.state.curObjectRefs))
+	rc := make([]ObjectCapabilityPair, len(o.state.curObjectRefs))
 	copy(rc, o.state.curObjectRefs)
 	return vc, rc, nil
 }
@@ -565,14 +579,14 @@ func (o *Object) ValueReferences() ([]byte, []*Object, error) {
 // takes copies of both the value and the references so if you modify
 // either after calling this method, your modifications will not take
 // effect.
-func (o *Object) Set(value []byte, references ...*Object) error {
+func (o *Object) Set(value []byte, references ...ObjectCapabilityPair) error {
 	if err := o.checkExpired(); err != nil {
 		return err
 	}
 	o.state.write = true
 	o.state.curValue = make([]byte, len(value))
 	copy(o.state.curValue, value)
-	o.state.curObjectRefs = make([]*Object, len(references))
+	o.state.curObjectRefs = make([]ObjectCapabilityPair, len(references))
 	copy(o.state.curObjectRefs, references)
 	return nil
 }

@@ -4,7 +4,6 @@ import (
 	"goshawkdb.io/common"
 	msgs "goshawkdb.io/common/capnp"
 	// "fmt"
-	capn "github.com/glycerine/go-capnproto"
 	"log"
 	"sync"
 )
@@ -12,7 +11,12 @@ import (
 type valueRef struct {
 	version    *common.TxnId
 	value      []byte
-	references []*common.VarUUId
+	references []refCap
+}
+
+type refCap struct {
+	vUUId        *common.VarUUId
+	capabilities msgs.Capabilities
 }
 
 type cache struct {
@@ -102,9 +106,9 @@ func (c *cache) updateFromDelete(vUUId *common.VarUUId, txnId *common.TxnId) {
 	}
 }
 
-func (c *cache) updateFromWrite(txnId *common.TxnId, vUUId *common.VarUUId, value []byte, refs *capn.DataList) bool {
+func (c *cache) updateFromWrite(txnId *common.TxnId, vUUId *common.VarUUId, value []byte, refs *msgs.ClientVarIdPos_List) bool {
 	vr, found := c.m[*vUUId]
-	references := make([]*common.VarUUId, refs.Len())
+	references := make([]refCap, refs.Len())
 	switch {
 	case found && vr.version.Compare(txnId) == common.EQ:
 		log.Fatal("Divergence discovered on update of ", vUUId, ": server thinks we don't have ", txnId, " but we do!")
@@ -121,7 +125,12 @@ func (c *cache) updateFromWrite(txnId *common.TxnId, vUUId *common.VarUUId, valu
 	vr.version = txnId
 	vr.value = value
 	for idz, n := 0, refs.Len(); idz < n; idz++ {
-		vr.references[idz] = common.MakeVarUUId(refs.At(idz))
+		ref := refs.At(idz)
+		if varId := ref.VarId(); len(varId) > 0 {
+			rc := &references[idz]
+			rc.vUUId = common.MakeVarUUId(varId)
+			rc.capabilities = ref.Capabilities()
+		}
 	}
 	return found
 }
