@@ -286,8 +286,8 @@ func (txn *Txn) submitToServer() (bool, error) {
 			refs := msgs.NewClientVarIdPosList(seg, len(state.curObjectRefs))
 			for idy, ocp := range state.curObjectRefs {
 				ref := refs.At(idy)
-				ref.SetVarId(ocp.object.Id[:])
-				ref.SetCapabilities(ocp.capabilities)
+				ref.SetVarId(ocp.Object.Id[:])
+				ref.SetCapabilities(ocp.capabilities.Capabilities)
 			}
 			switch {
 			case idx < readwriteThresh:
@@ -329,7 +329,7 @@ func (txn *Txn) GetRootObjects() (map[string]ObjectCapabilityPair, error) {
 	for name, rc := range txn.roots {
 		if obj, err := txn.GetObject(rc.vUUId); err == nil {
 			roots[name] = ObjectCapabilityPair{
-				object:       obj,
+				Object:       obj,
 				capabilities: rc.capabilities,
 			}
 		} else {
@@ -421,6 +421,7 @@ func (txn *Txn) String() string {
 // reused and pointer equality will work as expected. This is true for
 // also nested transactions.
 type Object struct {
+	ObjectCapabilityPair
 	// The unique Id of the object.
 	Id    *common.VarUUId
 	conn  *Connection
@@ -428,8 +429,53 @@ type Object struct {
 }
 
 type ObjectCapabilityPair struct {
-	object       *Object
-	capabilities msgs.Capabilities
+	*Object
+	capabilities *common.Capabilities
+}
+
+func (ocp ObjectCapabilityPair) String() string {
+	return fmt.Sprintf("Reference to %v with %v", ocp.Object.Id, ocp.capabilities)
+}
+
+func (ocp ObjectCapabilityPair) ValueCapability() ValueCapability {
+	switch ocp.capabilities.Value() {
+	case msgs.VALUECAPABILITY_NONE:
+		return ValueNone
+	case msgs.VALUECAPABILITY_READ:
+		return ValueRead
+	case msgs.VALUECAPABILITY_WRITE:
+		return ValueWrite
+	default:
+		return ValueReadWrite
+	}
+}
+
+func (ocp ObjectCapabilityPair) ReferencesReadCapability() ReferencesReadCapability {
+	switch ocp.capabilities.References().Read().Which() {
+	case msgs.CAPABILITIESREFERENCESREAD_ALL:
+		return ReferencesReadAll
+	default:
+		only := ocp.capabilities.References().Read().Only()
+		if only.Len() == 0 {
+			return ReferencesReadNone
+		} else {
+			return ReferencesReadOnly(only.ToArray())
+		}
+	}
+}
+
+func (ocp ObjectCapabilityPair) ReferencesWriteCapability() ReferencesWriteCapability {
+	switch ocp.capabilities.References().Write().Which() {
+	case msgs.CAPABILITIESREFERENCESWRITE_ALL:
+		return ReferencesWriteAll
+	default:
+		only := ocp.capabilities.References().Write().Only()
+		if only.Len() == 0 {
+			return ReferencesWriteNone
+		} else {
+			return ReferencesWriteOnly(only.ToArray())
+		}
+	}
 }
 
 type objectState struct {
@@ -489,15 +535,134 @@ func (o *Object) maybeRecordRead(ignoreWritten bool) error {
 			if rc.vUUId != nil {
 				ocp := &refs[idx]
 				ocp.capabilities = rc.capabilities
-				ocp.object, err = state.txn.GetObject(rc.vUUId)
+				ocp.Object, err = state.txn.GetObject(rc.vUUId)
 				if err != nil {
 					return err
 				}
+				ocp.Object.capabilities = ocp.Object.capabilities.Union(ocp.capabilities)
 			}
 		}
 		state.curObjectRefs = refs
 	}
 	return nil
+}
+
+// value capabilities
+
+type ValueCapability uint8
+
+const (
+	ValueNone      ValueCapability = iota
+	ValueRead      ValueCapability = iota
+	ValueWrite     ValueCapability = iota
+	ValueReadWrite ValueCapability = iota
+)
+
+// read refs
+
+type ReferencesReadCapability interface {
+	witness() ReferencesReadCapability
+}
+
+var (
+	ReferencesReadNone = &referencesReadNone{}
+	ReferencesReadAll  = &referencesReadAll{}
+)
+
+type referencesReadNone struct{}
+
+func (rrn *referencesReadNone) witness() ReferencesReadCapability {
+	return rrn
+}
+
+type referencesReadAll struct{}
+
+func (rra *referencesReadAll) witness() ReferencesReadCapability {
+	return rra
+}
+
+type ReferencesReadOnly []uint32
+
+func (rro ReferencesReadOnly) witness() ReferencesReadCapability {
+	return rro
+}
+
+// write refs
+
+type ReferencesWriteCapability interface {
+	witness() ReferencesWriteCapability
+}
+
+var (
+	ReferencesWriteNone = &referencesWriteNone{}
+	ReferencesWriteAll  = &referencesWriteAll{}
+)
+
+type referencesWriteNone struct{}
+
+func (rrn *referencesWriteNone) witness() ReferencesWriteCapability {
+	return rrn
+}
+
+type referencesWriteAll struct{}
+
+func (rra *referencesWriteAll) witness() ReferencesWriteCapability {
+	return rra
+}
+
+type ReferencesWriteOnly []uint32
+
+func (rro ReferencesWriteOnly) witness() ReferencesWriteCapability {
+	return rro
+}
+
+func (o *Object) GrantCapabilities(value ValueCapability, refsRead ReferencesReadCapability, refsWrite ReferencesWriteCapability) ObjectCapabilityPair {
+	seg := capn.NewBuffer(nil)
+	cap := msgs.NewCapabilities(seg)
+	switch value {
+	case ValueNone:
+		cap.SetValue(msgs.VALUECAPABILITY_NONE)
+	case ValueRead:
+		cap.SetValue(msgs.VALUECAPABILITY_READ)
+	case ValueWrite:
+		cap.SetValue(msgs.VALUECAPABILITY_WRITE)
+	case ValueReadWrite:
+		cap.SetValue(msgs.VALUECAPABILITY_READWRITE)
+	}
+	ref := cap.References()
+	refRead := ref.Read()
+	switch {
+	case refsRead == ReferencesReadAll:
+		refRead.SetAll()
+	case refsRead == ReferencesReadNone:
+		only := seg.NewUInt32List(0)
+		refRead.SetOnly(only)
+	default:
+		indices := refsRead.(ReferencesReadOnly)
+		only := seg.NewUInt32List(len(indices))
+		for idx, index := range indices {
+			only.Set(idx, index)
+		}
+	}
+	refWrite := ref.Write()
+	switch {
+	case refsWrite == ReferencesWriteAll:
+		refWrite.SetAll()
+	case refsWrite == ReferencesWriteNone:
+		only := seg.NewUInt32List(0)
+		refWrite.SetOnly(only)
+	default:
+		indices := refsWrite.(ReferencesWriteOnly)
+		only := seg.NewUInt32List(len(indices))
+		for idx, index := range indices {
+			only.Set(idx, index)
+		}
+	}
+
+	return ObjectCapabilityPair{
+		Object:       o,
+		capabilities: common.NewCapabilities(cap),
+	}
 }
 
 // Returns the TxnId of the last transaction that wrote to this

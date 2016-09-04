@@ -512,7 +512,7 @@ func (cash *connectionAwaitServerHandshake) start() (bool, error) {
 			rootCap := rootsCap.At(idx)
 			roots[rootCap.Name()] = &refCap{
 				vUUId:        common.MakeVarUUId(rootCap.VarId()),
-				capabilities: rootCap.Capabilities(),
+				capabilities: common.NewCapabilities(rootCap.Capabilities()),
 			}
 		}
 		cash.lock.Lock()

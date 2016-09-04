@@ -16,7 +16,7 @@ type valueRef struct {
 
 type refCap struct {
 	vUUId        *common.VarUUId
-	capabilities msgs.Capabilities
+	capabilities *common.Capabilities
 }
 
 type cache struct {
@@ -114,22 +114,20 @@ func (c *cache) updateFromWrite(txnId *common.TxnId, vUUId *common.VarUUId, valu
 		log.Fatal("Divergence discovered on update of ", vUUId, ": server thinks we don't have ", txnId, " but we do!")
 		return false
 	case found:
-		// Must use the new array because there could be txns in
-		// progress that still have pointers to the old array.
-		vr.references = references
 	default:
-		vr = &valueRef{references: references}
+		vr = &valueRef{}
 		c.m[*vUUId] = vr
 	}
 	// fmt.Printf("%v updated (%v -> %v)\n", vUUId, vr.version, txnId)
+	vr.references = references
 	vr.version = txnId
 	vr.value = value
 	for idz, n := 0, refs.Len(); idz < n; idz++ {
 		ref := refs.At(idz)
-		if varId := ref.VarId(); len(varId) > 0 {
+		if varId := ref.VarId(); len(varId) == common.KeyLen {
 			rc := &references[idz]
 			rc.vUUId = common.MakeVarUUId(varId)
-			rc.capabilities = ref.Capabilities()
+			rc.capabilities = common.NewCapabilities(ref.Capabilities())
 		}
 	}
 	return found
