@@ -287,7 +287,7 @@ func (txn *Txn) submitToServer() (bool, error) {
 			for idy, ocp := range state.curObjectRefs {
 				ref := refs.At(idy)
 				ref.SetVarId(ocp.Object.Id[:])
-				ref.SetCapabilities(ocp.capabilities.Capabilities)
+				ref.SetCapability(ocp.capability.Capability)
 			}
 			switch {
 			case idx < readwriteThresh:
@@ -329,8 +329,8 @@ func (txn *Txn) GetRootObjects() (map[string]ObjectCapabilityPair, error) {
 	for name, rc := range txn.roots {
 		if obj, err := txn.GetObject(rc.vUUId); err == nil {
 			roots[name] = ObjectCapabilityPair{
-				Object:       obj,
-				capabilities: rc.capabilities,
+				Object:     obj,
+				capability: rc.capability,
 			}
 		} else {
 			return nil, err
@@ -430,51 +430,23 @@ type Object struct {
 
 type ObjectCapabilityPair struct {
 	*Object
-	capabilities *common.Capabilities
+	capability *common.Capability
 }
 
 func (ocp ObjectCapabilityPair) String() string {
-	return fmt.Sprintf("Reference to %v with %v", ocp.Object.Id, ocp.capabilities)
+	return fmt.Sprintf("Reference to %v with %v", ocp.Object.Id, ocp.capability)
 }
 
-func (ocp ObjectCapabilityPair) ValueCapability() ValueCapability {
-	switch ocp.capabilities.Value() {
-	case msgs.VALUECAPABILITY_NONE:
-		return ValueNone
-	case msgs.VALUECAPABILITY_READ:
-		return ValueRead
-	case msgs.VALUECAPABILITY_WRITE:
-		return ValueWrite
+func (ocp ObjectCapabilityPair) Capability() Capability {
+	switch ocp.capability.Which() {
+	case msgs.CAPABILITY_NONE:
+		return None
+	case msgs.CAPABILITY_READ:
+		return Read
+	case msgs.CAPABILITY_WRITE:
+		return Write
 	default:
-		return ValueReadWrite
-	}
-}
-
-func (ocp ObjectCapabilityPair) ReferencesReadCapability() ReferencesReadCapability {
-	switch ocp.capabilities.References().Read().Which() {
-	case msgs.CAPABILITIESREFERENCESREAD_ALL:
-		return ReferencesReadAll
-	default:
-		only := ocp.capabilities.References().Read().Only()
-		if only.Len() == 0 {
-			return ReferencesReadNone
-		} else {
-			return ReferencesReadOnly(only.ToArray())
-		}
-	}
-}
-
-func (ocp ObjectCapabilityPair) ReferencesWriteCapability() ReferencesWriteCapability {
-	switch ocp.capabilities.References().Write().Which() {
-	case msgs.CAPABILITIESREFERENCESWRITE_ALL:
-		return ReferencesWriteAll
-	default:
-		only := ocp.capabilities.References().Write().Only()
-		if only.Len() == 0 {
-			return ReferencesWriteNone
-		} else {
-			return ReferencesWriteOnly(only.ToArray())
-		}
+		return ReadWrite
 	}
 }
 
@@ -534,12 +506,12 @@ func (o *Object) maybeRecordRead(ignoreWritten bool) error {
 		for idx, rc := range valueRef.references {
 			if rc.vUUId != nil {
 				ocp := &refs[idx]
-				ocp.capabilities = rc.capabilities
+				ocp.capability = rc.capability
 				ocp.Object, err = state.txn.GetObject(rc.vUUId)
 				if err != nil {
 					return err
 				}
-				ocp.Object.capabilities = ocp.Object.capabilities.Union(ocp.capabilities)
+				ocp.Object.capability = ocp.Object.capability.Union(ocp.capability)
 			}
 		}
 		state.curObjectRefs = refs
@@ -547,121 +519,32 @@ func (o *Object) maybeRecordRead(ignoreWritten bool) error {
 	return nil
 }
 
-// value capabilities
-
-type ValueCapability uint8
+type Capability uint8
 
 const (
-	ValueNone      ValueCapability = iota
-	ValueRead      ValueCapability = iota
-	ValueWrite     ValueCapability = iota
-	ValueReadWrite ValueCapability = iota
+	None      Capability = iota
+	Read      Capability = iota
+	Write     Capability = iota
+	ReadWrite Capability = iota
 )
 
-// read refs
-
-type ReferencesReadCapability interface {
-	witness() ReferencesReadCapability
-}
-
-var (
-	ReferencesReadNone = &referencesReadNone{}
-	ReferencesReadAll  = &referencesReadAll{}
-)
-
-type referencesReadNone struct{}
-
-func (rrn *referencesReadNone) witness() ReferencesReadCapability {
-	return rrn
-}
-
-type referencesReadAll struct{}
-
-func (rra *referencesReadAll) witness() ReferencesReadCapability {
-	return rra
-}
-
-type ReferencesReadOnly []uint32
-
-func (rro ReferencesReadOnly) witness() ReferencesReadCapability {
-	return rro
-}
-
-// write refs
-
-type ReferencesWriteCapability interface {
-	witness() ReferencesWriteCapability
-}
-
-var (
-	ReferencesWriteNone = &referencesWriteNone{}
-	ReferencesWriteAll  = &referencesWriteAll{}
-)
-
-type referencesWriteNone struct{}
-
-func (rrn *referencesWriteNone) witness() ReferencesWriteCapability {
-	return rrn
-}
-
-type referencesWriteAll struct{}
-
-func (rra *referencesWriteAll) witness() ReferencesWriteCapability {
-	return rra
-}
-
-type ReferencesWriteOnly []uint32
-
-func (rro ReferencesWriteOnly) witness() ReferencesWriteCapability {
-	return rro
-}
-
-func (o *Object) GrantCapabilities(value ValueCapability, refsRead ReferencesReadCapability, refsWrite ReferencesWriteCapability) ObjectCapabilityPair {
+func (o *Object) GrantCapability(capability Capability) ObjectCapabilityPair {
 	seg := capn.NewBuffer(nil)
-	cap := msgs.NewCapabilities(seg)
-	switch value {
-	case ValueNone:
-		cap.SetValue(msgs.VALUECAPABILITY_NONE)
-	case ValueRead:
-		cap.SetValue(msgs.VALUECAPABILITY_READ)
-	case ValueWrite:
-		cap.SetValue(msgs.VALUECAPABILITY_WRITE)
-	case ValueReadWrite:
-		cap.SetValue(msgs.VALUECAPABILITY_READWRITE)
-	}
-	ref := cap.References()
-	refRead := ref.Read()
-	switch {
-	case refsRead == ReferencesReadAll:
-		refRead.SetAll()
-	case refsRead == ReferencesReadNone:
-		only := seg.NewUInt32List(0)
-		refRead.SetOnly(only)
-	default:
-		indices := refsRead.(ReferencesReadOnly)
-		only := seg.NewUInt32List(len(indices))
-		for idx, index := range indices {
-			only.Set(idx, index)
-		}
-	}
-	refWrite := ref.Write()
-	switch {
-	case refsWrite == ReferencesWriteAll:
-		refWrite.SetAll()
-	case refsWrite == ReferencesWriteNone:
-		only := seg.NewUInt32List(0)
-		refWrite.SetOnly(only)
-	default:
-		indices := refsWrite.(ReferencesWriteOnly)
-		only := seg.NewUInt32List(len(indices))
-		for idx, index := range indices {
-			only.Set(idx, index)
-		}
+	cap := msgs.NewCapability(seg)
+	switch capability {
+	case None:
+		cap.SetNone()
+	case Read:
+		cap.SetRead()
+	case Write:
+		cap.SetWrite()
+	case ReadWrite:
+		cap.SetReadWrite()
 	}
 
 	return ObjectCapabilityPair{
-		Object:       o,
-		capabilities: common.NewCapabilities(cap),
+		Object:     o,
+		capability: common.NewCapability(cap),
 	}
 }
 

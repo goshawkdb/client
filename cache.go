@@ -15,8 +15,8 @@ type valueRef struct {
 }
 
 type refCap struct {
-	vUUId        *common.VarUUId
-	capabilities *common.Capabilities
+	vUUId      *common.VarUUId
+	capability *common.Capability
 }
 
 type cache struct {
@@ -127,7 +127,7 @@ func (c *cache) updateFromWrite(txnId *common.TxnId, vUUId *common.VarUUId, valu
 		if varId := ref.VarId(); len(varId) == common.KeyLen {
 			rc := &references[idz]
 			rc.vUUId = common.MakeVarUUId(varId)
-			rc.capabilities = common.NewCapabilities(ref.Capabilities())
+			rc.capability = common.NewCapability(ref.Capability())
 		}
 	}
 	return found
