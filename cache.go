@@ -1,9 +1,9 @@
 package client
 
 import (
+	// "fmt"
 	"goshawkdb.io/common"
 	msgs "goshawkdb.io/common/capnp"
-	// "fmt"
 	"log"
 	"sync"
 )
@@ -73,7 +73,7 @@ func (c *cache) updateFromTxnAbort(updates *msgs.ClientUpdate_List) []*common.Va
 		for idy, m := 0, actions.Len(); idy < m; idy++ {
 			action := actions.At(idy)
 			vUUId := common.MakeVarUUId(action.VarId())
-			//fmt.Printf("%v@%v ", vUUId, txnId)
+			// fmt.Printf("abort %v@%v ", vUUId, txnId)
 			switch action.Which() {
 			case msgs.CLIENTACTION_DELETE:
 				c.updateFromDelete(vUUId, txnId)
