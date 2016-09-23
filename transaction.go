@@ -156,10 +156,10 @@ func (txn *Txn) run() (interface{}, *Stats, error) {
 func (txn *Txn) resetObjects() {
 	for vUUId, obj := range txn.objs {
 		if obj.state.txn == txn {
-			// log.Printf("%v resetting %v\n", txn, obj.Id)
+			// log.Printf("%v resetting %v\n", txn, obj.id)
 			obj.state = obj.state.parentState
 		}
-		// log.Printf("%v deleting %v\n", txn, obj.Id)
+		// log.Printf("%v deleting %v\n", txn, obj.id)
 		delete(txn.objs, vUUId)
 	}
 }
@@ -168,8 +168,8 @@ func (txn *Txn) submitRetryTransaction() error {
 	reads := make(map[common.VarUUId]*objectState)
 	for ancestor := txn; ancestor != nil; ancestor = ancestor.parent {
 		for _, obj := range ancestor.objs {
-			if _, found := reads[*obj.Id]; !found && obj.state.txn == ancestor && obj.state.read {
-				reads[*obj.Id] = obj.state
+			if _, found := reads[*obj.id]; !found && obj.state.txn == ancestor && obj.state.read {
+				reads[*obj.id] = obj.state
 			}
 		}
 	}
@@ -181,7 +181,7 @@ func (txn *Txn) submitRetryTransaction() error {
 	idx := 0
 	for _, state := range reads {
 		action := actions.At(idx)
-		action.SetVarId(state.Id[:])
+		action.SetVarId(state.id[:])
 		action.SetRead()
 		action.Read().SetVersion(state.curVersion[:])
 		idx++
@@ -207,10 +207,10 @@ func (txn *Txn) moveObjsToParent() {
 			if state.parentState != nil && state.parentState.txn == parent {
 				state.parentState = state.parentState.parentState
 			}
-			// log.Printf("%v Set %v state[%p] to %v\n", txn, obj.Id, parent, state)
-			if _, found := objs[*obj.Id]; !found {
-				// log.Printf("%v added to parent objs %v\n", txn, obj.Id)
-				objs[*obj.Id] = obj
+			// log.Printf("%v Set %v state[%p] to %v\n", txn, obj.id, parent, state)
+			if _, found := objs[*obj.id]; !found {
+				// log.Printf("%v added to parent objs %v\n", txn, obj.id)
+				objs[*obj.id] = obj
 			}
 		}
 	}
@@ -278,7 +278,7 @@ func (txn *Txn) submitToServer() (bool, error) {
 	idx := 0
 	for _, state := range total {
 		action := actions.At(idx)
-		action.SetVarId(state.Id[:])
+		action.SetVarId(state.id[:])
 		if idx < writeThresh {
 			action.SetRead()
 			action.Read().SetVersion(state.curVersion[:])
@@ -286,7 +286,7 @@ func (txn *Txn) submitToServer() (bool, error) {
 			refs := msgs.NewClientVarIdPosList(seg, len(state.curObjectRefs))
 			for idy, ocp := range state.curObjectRefs {
 				ref := refs.At(idy)
-				ref.SetVarId(ocp.Object.Id[:])
+				ref.SetVarId(ocp.id[:])
 				ref.SetCapability(ocp.capability.Capability)
 			}
 			switch {
@@ -327,11 +327,12 @@ func (txn *Txn) submitToServer() (bool, error) {
 func (txn *Txn) GetRootObjects() (map[string]ObjectCapabilityPair, error) {
 	roots := make(map[string]ObjectCapabilityPair, len(txn.roots))
 	for name, rc := range txn.roots {
-		if obj, err := txn.GetObject(rc.vUUId); err == nil {
-			roots[name] = ObjectCapabilityPair{
-				Object:     obj,
-				capability: rc.capability,
-			}
+		ocp := ObjectCapabilityPair{
+			Object:     &Object{id: rc.vUUId},
+			capability: rc.capability,
+		}
+		if obj, err := txn.GetObject(ocp); err == nil {
+			roots[name] = obj
 		} else {
 			return nil, err
 		}
@@ -350,10 +351,12 @@ func (txn *Txn) CreateObject(value []byte, references ...ObjectCapabilityPair) (
 	}
 
 	obj := &Object{
-		Id:   txn.conn.nextVarUUId(),
+		id:   txn.conn.nextVarUUId(),
 		conn: txn.conn,
 	}
-	txn.objs[*obj.Id] = obj
+	obj.ObjectCapabilityPair = ObjectCapabilityPair{Object: obj}.GrantCapability(ReadWrite)
+	txn.objs[*obj.id] = obj
+
 	state := &objectState{
 		Object:        obj,
 		parentState:   nil,
@@ -364,9 +367,9 @@ func (txn *Txn) CreateObject(value []byte, references ...ObjectCapabilityPair) (
 	}
 	copy(state.curValue, value)
 	copy(state.curObjectRefs, references)
-
 	obj.state = state
-	return obj.GrantCapability(ReadWrite), nil
+
+	return obj.ObjectCapabilityPair, nil
 }
 
 // Fetches the object specified by its unique object id. Note this
@@ -374,39 +377,48 @@ func (txn *Txn) CreateObject(value []byte, references ...ObjectCapabilityPair) (
 // at least as far as any object that has a reference to the object
 // id. This method is not normally necessary: it is generally
 // preferred to use the References of objects to navigate.
-func (txn *Txn) GetObject(vUUId *common.VarUUId) (*Object, error) {
+func (txn *Txn) GetObject(ocp ObjectCapabilityPair) (ObjectCapabilityPair, error) {
 	if txn.resetInProgress {
-		return nil, Restart
+		return ObjectCapabilityPair{}, Restart
 	}
-	return txn.getObject(vUUId, true), nil
+	return txn.getObject(ocp, true), nil
 }
 
-func (txn *Txn) getObject(vUUId *common.VarUUId, addToTxn bool) *Object {
-	if obj, found := txn.objs[*vUUId]; found {
-		return obj
+func (txn *Txn) getObject(ocp ObjectCapabilityPair, addToTxn bool) ObjectCapabilityPair {
+	if obj, found := txn.objs[*ocp.id]; found {
+		obj.capability = obj.capability.Union(ocp.capability)
+		return obj.ObjectCapabilityPair
 	}
 
 	if txn.parent != nil {
-		if obj := txn.parent.getObject(vUUId, false); obj != nil {
+		if obj := txn.parent.getObject(ocp, false); obj.Object != nil {
 			if addToTxn {
 				obj.state = obj.state.clone(txn)
-				txn.objs[*vUUId] = obj
+				txn.objs[*obj.id] = obj.Object
 			}
-			return obj
+			obj.capability = obj.capability.Union(ocp.capability)
+			return obj.ObjectCapabilityPair
 		}
 	}
 
 	if addToTxn {
+		// Can't reuse ocp.Object because it could be from a different
+		// connection. Obviously this could be abused to extend
+		// capabilities, but the server enforces them ultimately.
 		obj := &Object{
-			Id:   vUUId,
+			id:   ocp.id,
 			conn: txn.conn,
 		}
-		txn.objs[*obj.Id] = obj
+		obj.ObjectCapabilityPair = ObjectCapabilityPair{
+			Object:     obj,
+			capability: ocp.capability,
+		}
+		txn.objs[*obj.id] = obj
 		obj.state = &objectState{Object: obj, txn: txn}
-		return obj
+		return obj.ObjectCapabilityPair
 	}
 
-	return nil
+	return ObjectCapabilityPair{}
 }
 
 func (txn *Txn) String() string {
@@ -418,15 +430,23 @@ func (txn *Txn) String() string {
 // permitted to use the same Object in both connections; instead, you
 // should retrieve the same Object Id through both
 // connections. However, within the same Connection, Objects may be
-// reused and pointer equality will work as expected. This is true for
-// also nested transactions.
+// reused and pointer equality will work as expected. This is also
+// true for nested transactions.
 type Object struct {
 	ObjectCapabilityPair
-	// The unique Id of the object.
-	Id    *common.VarUUId
+	id    *common.VarUUId
 	conn  *Connection
 	state *objectState
 }
+
+type Capability uint8
+
+const (
+	None      Capability = iota
+	Read      Capability = iota
+	Write     Capability = iota
+	ReadWrite Capability = iota
+)
 
 type ObjectCapabilityPair struct {
 	*Object
@@ -434,7 +454,7 @@ type ObjectCapabilityPair struct {
 }
 
 func (ocp ObjectCapabilityPair) String() string {
-	return fmt.Sprintf("Reference to %v with %v", ocp.Object.Id, ocp.capability)
+	return fmt.Sprintf("Reference to %v with %v", ocp.id, ocp.capability)
 }
 
 func (ocp ObjectCapabilityPair) Capability() Capability {
@@ -447,6 +467,26 @@ func (ocp ObjectCapabilityPair) Capability() Capability {
 		return Write
 	default:
 		return ReadWrite
+	}
+}
+
+func (ocp ObjectCapabilityPair) GrantCapability(capability Capability) ObjectCapabilityPair {
+	seg := capn.NewBuffer(nil)
+	cap := msgs.NewCapability(seg)
+	switch capability {
+	case None:
+		cap.SetNone()
+	case Read:
+		cap.SetRead()
+	case Write:
+		cap.SetWrite()
+	case ReadWrite:
+		cap.SetReadWrite()
+	}
+
+	return ObjectCapabilityPair{
+		Object:     ocp.Object,
+		capability: common.NewCapability(cap),
 	}
 }
 
@@ -481,21 +521,21 @@ func (o *Object) maybeRecordRead(ignoreWritten bool) error {
 	if state.create || state.read || (state.write && !ignoreWritten) {
 		return nil
 	}
-	valueRef := state.txn.cache.Get(o.Id)
+	valueRef := state.txn.cache.Get(o.id)
 	if valueRef == nil {
-		modifiedVars, elapsed, err := loadVar(o.Id, o.conn)
+		modifiedVars, elapsed, err := loadVar(o.id, o.conn)
 		if err != nil {
 			return err
 		}
 		if state.txn.varsUpdated(modifiedVars) {
 			return Restart
 		}
-		valueRef = state.txn.cache.Get(o.Id)
+		valueRef = state.txn.cache.Get(o.id)
 		if valueRef == nil {
-			return fmt.Errorf("Loading var %v failed to find value / update cache", o.Id)
+			return fmt.Errorf("Loading var %v failed to find value / update cache", o.id)
 		}
-		// log.Println(o.state.txn, "load", o.Id, "->", valueRef.version, modifiedVars)
-		state.txn.stats.Loads[*o.Id] = elapsed
+		// log.Println(o.state.txn, "load", o.id, "->", valueRef.version, modifiedVars)
+		state.txn.stats.Loads[*o.id] = elapsed
 	}
 	state.read = true
 	state.curVersion = valueRef.version
@@ -507,11 +547,11 @@ func (o *Object) maybeRecordRead(ignoreWritten bool) error {
 			if rc.vUUId != nil {
 				ocp := &refs[idx]
 				ocp.capability = rc.capability
-				ocp.Object, err = state.txn.GetObject(rc.vUUId)
+				ocp.Object = &Object{id: rc.vUUId}
+				*ocp, err = state.txn.GetObject(*ocp)
 				if err != nil {
 					return err
 				}
-				ocp.Object.capability = ocp.Object.capability.Union(ocp.capability)
 			}
 		}
 		state.curObjectRefs = refs
@@ -519,39 +559,13 @@ func (o *Object) maybeRecordRead(ignoreWritten bool) error {
 	return nil
 }
 
-type Capability uint8
-
-const (
-	None      Capability = iota
-	Read      Capability = iota
-	Write     Capability = iota
-	ReadWrite Capability = iota
-)
-
-func (o *Object) GrantCapability(capability Capability) ObjectCapabilityPair {
-	seg := capn.NewBuffer(nil)
-	cap := msgs.NewCapability(seg)
-	switch capability {
-	case None:
-		cap.SetNone()
-	case Read:
-		cap.SetRead()
-	case Write:
-		cap.SetWrite()
-	case ReadWrite:
-		cap.SetReadWrite()
-	}
-
-	return ObjectCapabilityPair{
-		Object:     o,
-		capability: common.NewCapability(cap),
-	}
-}
-
 // Returns the TxnId of the last transaction that wrote to this
 // object. If an error is returned, the current transaction should
 // immediately be restarted (return the error Restart)
 func (o *Object) Version() (*common.TxnId, error) {
+	if err := o.checkCanRead(); err != nil {
+		return nil, err
+	}
 	if err := o.checkExpired(); err != nil {
 		return nil, err
 	}
@@ -570,6 +584,9 @@ func (o *Object) Version() (*common.TxnId, error) {
 // to modify it but you will need to call the Set method for any
 // modifications to take effect.
 func (o *Object) Value() ([]byte, error) {
+	if err := o.checkCanRead(); err != nil {
+		return nil, err
+	}
 	if err := o.checkExpired(); err != nil {
 		return nil, err
 	}
@@ -587,6 +604,9 @@ func (o *Object) Value() ([]byte, error) {
 // references so you are safe to modify it, but you will need to call
 // the Set method for any modifications to take effect.
 func (o *Object) References() ([]ObjectCapabilityPair, error) {
+	if err := o.checkCanRead(); err != nil {
+		return nil, err
+	}
 	if err := o.checkExpired(); err != nil {
 		return nil, err
 	}
@@ -605,6 +625,9 @@ func (o *Object) References() ([]ObjectCapabilityPair, error) {
 // current references so you are safe to modify them but you will need
 // to call the Set method for any modifications to take effect.
 func (o *Object) ValueReferences() ([]byte, []ObjectCapabilityPair, error) {
+	if err := o.checkCanRead(); err != nil {
+		return nil, nil, err
+	}
 	if err := o.checkExpired(); err != nil {
 		return nil, nil, err
 	}
@@ -628,6 +651,9 @@ func (o *Object) ValueReferences() ([]byte, []ObjectCapabilityPair, error) {
 // either after calling this method, your modifications will not take
 // effect.
 func (o *Object) Set(value []byte, references ...ObjectCapabilityPair) error {
+	if err := o.checkCanWrite(); err != nil {
+		return err
+	}
 	if err := o.checkExpired(); err != nil {
 		return err
 	}
@@ -641,11 +667,29 @@ func (o *Object) Set(value []byte, references ...ObjectCapabilityPair) error {
 
 func (o *Object) checkExpired() error {
 	if o.state == nil {
-		return fmt.Errorf("Use of expired object: %v", o.Id)
+		return fmt.Errorf("Use of expired object: %v", o.id)
 	} else if o.state.txn.resetInProgress {
 		return Restart
 	}
 	return nil
+}
+
+func (o *Object) checkCanRead() error {
+	switch o.Capability() {
+	case Read, ReadWrite:
+		return nil
+	default:
+		return fmt.Errorf("Cannot read object: %v", o.id)
+	}
+}
+
+func (o *Object) checkCanWrite() error {
+	switch o.Capability() {
+	case Write, ReadWrite:
+		return nil
+	default:
+		return fmt.Errorf("Cannot write object: %v", o.id)
+	}
 }
 
 func loadVar(vUUId *common.VarUUId, conn *Connection) ([]*common.VarUUId, time.Duration, error) {
