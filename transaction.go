@@ -453,6 +453,11 @@ type ObjectCapabilityPair struct {
 	capability *common.Capability
 }
 
+func (a ObjectCapabilityPair) ReferencesSame(b ObjectCapabilityPair) bool {
+	return a.Object != nil && b.Object != nil &&
+		(a.Object == b.Object || a.Object.id.Compare(b.Object.id) == common.EQ)
+}
+
 func (ocp ObjectCapabilityPair) String() string {
 	return fmt.Sprintf("Reference to %v with %v", ocp.id, ocp.capability)
 }
