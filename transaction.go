@@ -344,9 +344,9 @@ func (txn *Txn) GetRootObjects() (map[string]ObjectCapabilityPair, error) {
 // restarted (return the error Restart). This method takes copies of
 // both the value and the references so if you modify either after
 // calling this method, your modifications will not take effect.
-func (txn *Txn) CreateObject(value []byte, references ...ObjectCapabilityPair) (*Object, error) {
+func (txn *Txn) CreateObject(value []byte, references ...ObjectCapabilityPair) (ObjectCapabilityPair, error) {
 	if txn.resetInProgress {
-		return nil, Restart
+		return ObjectCapabilityPair{}, Restart
 	}
 
 	obj := &Object{
@@ -366,7 +366,7 @@ func (txn *Txn) CreateObject(value []byte, references ...ObjectCapabilityPair) (
 	copy(state.curObjectRefs, references)
 
 	obj.state = state
-	return obj, nil
+	return obj.GrantCapability(ReadWrite), nil
 }
 
 // Fetches the object specified by its unique object id. Note this
