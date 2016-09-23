@@ -512,6 +512,8 @@ func (objRef ObjectRef) GrantCapability(capability Capability) ObjectRef {
 		cap.SetWrite()
 	case ReadWrite:
 		cap.SetReadWrite()
+	default:
+		panic(fmt.Sprintf("Unexpected capability value: %v", capability))
 	}
 
 	return ObjectRef{
