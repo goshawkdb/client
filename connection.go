@@ -119,16 +119,17 @@ func NewConnection(hostPort string, clientCertAndKeyPEM, clusterCertPEM []byte) 
 // the function is invoked potentially several times until it
 // completes successfully: either committing or choosing to abort. The
 // function should therefore be referentially transparent. Returning
-// any non-nil error will cause the transaction to be aborted with the
-// only exception that returning Restart when the transaction has
-// identified a restart is required will cause the transaction to be
-// immediately restarted.
+// any non-nil error will cause the transaction to be aborted. The
+// only exception to this rule is that returning Restart when the
+// transaction has identified a restart is required will cause the
+// transaction to be immediately restarted (methods on ObjectRef will
+// return Restart as necessary).
 //
-// The function final results are returned by this function, along
+// The function's final results are returned by this method, along
 // with statistics regarding how the transaction proceeded.
 //
 // This function automatically detects and creates nested
-// transactions: it is perfectly safe and expected to call
+// transactions: it is perfectly safe (and expected) to call
 // RunTransaction from within a transaction.
 func (conn *Connection) RunTransaction(fun func(*Txn) (interface{}, error)) (interface{}, *Stats, error) {
 	roots := conn.rootVarUUIds()

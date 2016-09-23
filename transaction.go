@@ -39,7 +39,7 @@ type Stats struct {
 	TxnId *common.TxnId
 }
 
-type TxnFunResult int
+type TxnFunResult uint8
 
 const (
 	// If you return Retry as the result (not error) of a transaction
@@ -340,11 +340,12 @@ func (txn *Txn) GetRootObjects() (map[string]ObjectRef, error) {
 	return roots, nil
 }
 
-// Create a new object and set its value and references. If an error
-// is returned, the current transaction should immediately be
-// restarted (return the error Restart). This method takes copies of
-// both the value and the references so if you modify either after
-// calling this method, your modifications will not take effect.
+// Create a new object and set its value and references. This method
+// takes copies of both the value and the references so if you modify
+// either after calling this method, your modifications will not take
+// effect. If the error is Restart, you should return Restart as an
+// error in the transaction. The ObjectRef returned will contain the
+// ReadWrite capability.
 func (txn *Txn) CreateObject(value []byte, references ...ObjectRef) (ObjectRef, error) {
 	if txn.resetInProgress {
 		return ObjectRef{}, Restart
@@ -372,11 +373,14 @@ func (txn *Txn) CreateObject(value []byte, references ...ObjectRef) (ObjectRef, 
 	return obj.ObjectRef, nil
 }
 
-// Fetches the object specified by its unique object id. Note this
-// will fail unless the client has already navigated the object graph
-// at least as far as any object that has a reference to the object
+// Fetches the ObjectRef specified by this ObjectRef. Note this will
+// fail unless the client has already navigated the object graph at
+// least as far as any object that has a reference to the object
 // id. This method is not normally necessary: it is generally
-// preferred to use the References of objects to navigate.
+// preferred to use the References of objects to navigate. This method
+// is useful if you are storing ObjectRefs outside the database object
+// graph and can guarantee the connection you're using will have
+// already reached the object in question.
 func (txn *Txn) GetObject(objRef ObjectRef) (ObjectRef, error) {
 	if txn.resetInProgress {
 		return ObjectRef{}, Restart
@@ -425,13 +429,6 @@ func (txn *Txn) String() string {
 	return fmt.Sprintf("txn_%p(%p)", txn, txn.parent)
 }
 
-// Object represents an object in the database. Objects are linked to
-// Connections: if you're using multiple Connections, it is not
-// permitted to use the same Object in both connections; instead, you
-// should retrieve the same Object Id through both
-// connections. However, within the same Connection, Objects may be
-// reused and pointer equality will work as expected. This is also
-// true for nested transactions.
 type object struct {
 	ObjectRef
 	id    *common.VarUUId
@@ -442,17 +439,37 @@ type object struct {
 type Capability uint8
 
 const (
-	None      Capability = iota
-	Read      Capability = iota
-	Write     Capability = iota
+	// An ObjectRef with the None capability grants you no actions on
+	// the object.
+	None Capability = iota
+	// An ObjectRef with the Read capability grants you the ability to
+	// read the object value, its version and its references.
+	Read Capability = iota
+	// An ObjectRef with the Write capability grants you the ability to
+	// set (write) the object value and references.
+	Write Capability = iota
+	// An ObjectRef with the ReadWrite capability grants you both the
+	// Read and Write capabilities.
 	ReadWrite Capability = iota
 )
 
+// ObjectRef represents a pointer to an object in the database,
+// combined with a capability to act on that object. ObjectRefs are
+// linked to Connections: if you're using multiple Connections, it is
+// not permitted to use the same ObjectRef in both connections; you
+// can either navigate to the same object in both connections or once
+// that is done in each connection, you can use GetObject to get a new
+// ObjectRef to the same object in the other connection. Within the
+// same Connection, and within nested transactions, ObjectRefs may be
+// freely reused.
 type ObjectRef struct {
 	*object
 	capability *common.Capability
 }
 
+// Use this method to test if two ObjectRefs are references to the
+// same object in the database. This method does not test for equality
+// of capability within the ObjectRefs.
 func (a ObjectRef) ReferencesSameAs(b ObjectRef) bool {
 	return a.object != nil && b.object != nil &&
 		(a.object == b.object || a.object.id.Compare(b.object.id) == common.EQ)
@@ -462,6 +479,7 @@ func (objRef ObjectRef) String() string {
 	return fmt.Sprintf("Reference to %v with %v", objRef.id, objRef.capability)
 }
 
+// Expose which capabilities this ObjectRef grants.
 func (objRef ObjectRef) Capability() Capability {
 	switch objRef.capability.Which() {
 	case msgs.CAPABILITY_NONE:
@@ -475,6 +493,13 @@ func (objRef ObjectRef) Capability() Capability {
 	}
 }
 
+// Create a new ObjectRef to the same database object but with
+// different capabilities. This will always succeed, but the
+// transaction may be rejected if you attempt to grant capabilities
+// you have not received. From a ReadWrite capability, you can grant
+// anything. From a Read capability you can grant only a Read or
+// None. From a Write capability you can grant only a Write or
+// None. From a None capability you can only grant a None.
 func (objRef ObjectRef) GrantCapability(capability Capability) ObjectRef {
 	seg := capn.NewBuffer(nil)
 	cap := msgs.NewCapability(seg)
@@ -565,8 +590,9 @@ func (o *object) maybeRecordRead(ignoreWritten bool) error {
 }
 
 // Returns the TxnId of the last transaction that wrote to this
-// object. If an error is returned, the current transaction should
-// immediately be restarted (return the error Restart)
+// object. If the error is Restart, you should return Restart as an
+// error in the transaction. This method will error if you do not have
+// the Read capability for this object.
 func (o *object) Version() (*common.TxnId, error) {
 	if err := o.checkCanRead(); err != nil {
 		return nil, err
@@ -583,11 +609,12 @@ func (o *object) Version() (*common.TxnId, error) {
 	return o.state.curVersion, nil
 }
 
-// Returns the current value of this object. If an error is returned,
-// the current transaction should immediately be restarted (return the
-// error Restart). Returns a copy of the current value so you are safe
-// to modify it but you will need to call the Set method for any
-// modifications to take effect.
+// Returns the current value of this object. Returns a copy of the
+// current value so you are safe to modify it but you will need to
+// call the Set method for any modifications to take effect. If the
+// error is Restart, you should return Restart as an error in the
+// transaction. This method will error if you do not have the Read
+// capability for this object.
 func (o *object) Value() ([]byte, error) {
 	if err := o.checkCanRead(); err != nil {
 		return nil, err
@@ -603,11 +630,12 @@ func (o *object) Value() ([]byte, error) {
 	return c, nil
 }
 
-// Returns the list of Objects to which this object refers. If an
-// error is returned, the current transaction should immediately be
-// restarted (return the error Restart). Returns a copy of the current
-// references so you are safe to modify it, but you will need to call
-// the Set method for any modifications to take effect.
+// Returns the slice of objects to which this object refers. Returns a
+// copy of the current references so you are safe to modify it, but
+// you will need to call the Set method for any modifications to take
+// effect. If the error is Restart, you should return Restart as an
+// error in the transaction. This method will error if you do not have
+// the Read capability for this object.
 func (o *object) References() ([]ObjectRef, error) {
 	if err := o.checkCanRead(); err != nil {
 		return nil, err
@@ -623,12 +651,13 @@ func (o *object) References() ([]ObjectRef, error) {
 	return rc, nil
 }
 
-// Returns the current value of this object the list of Objects to
-// which this object refers. If an error is returned, the current
-// transaction should immediately be restarted (return the error
-// Restart). Returns a copy of the current value and a copy of the
-// current references so you are safe to modify them but you will need
-// to call the Set method for any modifications to take effect.
+// Returns the current value of this object and the slice of objects
+// to which this object refers. Returns a copy of the current value
+// and a copy of the current references so you are safe to modify them
+// but you will need to call the Set method for any modifications to
+// take effect. If the error is Restart, you should return Restart as
+// an error in the transaction. This method will error if you do not
+// have the Read capability for this object.
 func (o *object) ValueReferences() ([]byte, []ObjectRef, error) {
 	if err := o.checkCanRead(); err != nil {
 		return nil, nil, err
@@ -649,12 +678,13 @@ func (o *object) ValueReferences() ([]byte, []ObjectRef, error) {
 // Sets the value and references of the current object. If the value
 // contains any references to other objects, they must be explicitly
 // declared as references otherwise on retrieval you will not be able
-// to navigate to them. Note that the order of references is
-// stable. If an error is returned, the current transaction should
-// immediately be restarted (return the error Restart). This method
-// takes copies of both the value and the references so if you modify
-// either after calling this method, your modifications will not take
-// effect.
+// to navigate to those objects. Note that the order of references is
+// stable and may contain duplicates. This method takes copies of both
+// the value and the references so if you modify either after calling
+// this method, your modifications will not take effect. If the error
+// is Restart, you should return Restart as an error in the
+// transaction. This method will error if you do not have the Write
+// capability for this object.
 func (o *object) Set(value []byte, references ...ObjectRef) error {
 	if err := o.checkCanWrite(); err != nil {
 		return err
