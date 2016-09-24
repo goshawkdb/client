@@ -1,6 +1,7 @@
 package client
 
 import (
+	"errors"
 	"fmt"
 	capn "github.com/glycerine/go-capnproto"
 	"goshawkdb.io/common"
@@ -327,12 +328,12 @@ func (txn *Txn) submitToServer() (bool, error) {
 func (txn *Txn) GetRootObjects() (map[string]ObjectRef, error) {
 	roots := make(map[string]ObjectRef, len(txn.roots))
 	for name, rc := range txn.roots {
-		objRef := ObjectRef{
-			object:     &object{id: rc.vUUId},
-			capability: rc.capability,
-		}
-		if obj, err := txn.GetObject(objRef); err == nil {
-			roots[name] = obj
+		if obj, err := txn.getObject(rc.vUUId, true); err == nil {
+			objRef := ObjectRef{
+				object:     obj,
+				capability: rc.capability,
+			}
+			roots[name] = objRef
 		} else {
 			return nil, err
 		}
@@ -385,48 +386,57 @@ func (txn *Txn) GetObject(objRef ObjectRef) (ObjectRef, error) {
 	if txn.resetInProgress {
 		return ObjectRef{}, Restart
 	}
-	return txn.getObject(objRef, true), nil
+	if objRef.object == nil {
+		return ObjectRef{}, errors.New("Attempt to dereference nil ObjectRef!")
+	}
+	obj, err := txn.getObject(objRef.id, true)
+	if err == nil {
+		objRef.object = obj
+		return objRef, nil
+	} else {
+		return ObjectRef{}, err
+	}
 }
 
-func (txn *Txn) getObject(objRef ObjectRef, addToTxn bool) ObjectRef {
-	if obj, found := txn.objs[*objRef.id]; found {
-		return obj.ObjectRef
+func (txn *Txn) getObject(vUUId *common.VarUUId, addToTxn bool) (*object, error) {
+	if obj, found := txn.objs[*vUUId]; found {
+		return obj, nil
 	}
 
 	if txn.parent != nil {
-		if obj := txn.parent.getObject(objRef, false); obj.object != nil {
+		if obj, err := txn.parent.getObject(vUUId, false); err != nil {
+			return nil, err
+		} else if obj != nil {
 			if addToTxn {
 				obj.state = obj.state.clone(txn)
-				txn.objs[*obj.id] = obj.object
+				txn.objs[*obj.id] = obj
 			}
-			return obj.ObjectRef
+			return obj, nil
 		}
 	}
 
 	if addToTxn {
-		valueRef := txn.cache.Get(objRef.id)
-		if valueRef == nil {
-			fmt.Printf("No such Object: %v\n", objRef.id)
-			return ObjectRef{}
+		vr := txn.cache.Get(vUUId)
+		if vr == nil {
+			return nil, fmt.Errorf("Attempt to dereference ObjectRef to unknown object: %v\n", vUUId)
 		}
 		// Can't reuse objRef.object because it could be from a different
 		// connection. Obviously this could be abused to extend
 		// capabilities, but the server enforces them ultimately.
 		obj := &object{
-			id:   objRef.id,
+			id:   vUUId,
 			conn: txn.conn,
 		}
 		obj.ObjectRef = ObjectRef{
 			object:     obj,
-			capability: valueRef.capability,
+			capability: vr.capability,
 		}
-		fmt.Printf("%v created new with %v\n", obj.id, obj.capability)
-		txn.objs[*obj.id] = obj
+		txn.objs[*vUUId] = obj
 		obj.state = &objectState{object: obj, txn: txn}
-		return obj.ObjectRef
+		return obj, nil
 	}
 
-	return ObjectRef{}
+	return nil, nil
 }
 
 func (txn *Txn) String() string {
@@ -483,8 +493,8 @@ func (objRef ObjectRef) String() string {
 	return fmt.Sprintf("Reference to %v with %v", objRef.id, objRef.capability)
 }
 
-// Expose which capabilities this ObjectRef grants.
-func (objRef ObjectRef) Capability() Capability {
+// Reveal which capabilities this ObjectRef contains.
+func (objRef ObjectRef) RefCapability() Capability {
 	switch objRef.capability.Which() {
 	case msgs.CAPABILITY_NONE:
 		return None
@@ -494,6 +504,18 @@ func (objRef ObjectRef) Capability() Capability {
 		return Write
 	default:
 		return ReadWrite
+	}
+}
+
+// Reveal which capabilities have been discovered by this client on
+// the object to which this ObjectRef refers. This is the union of the
+// capabilities from all of the ObjectRefs that refer to this same
+// object as encountered, to date, by this connection.
+func (objRef ObjectRef) ObjectCapability() Capability {
+	if objRef.object == nil {
+		return None
+	} else {
+		return objRef.object.ObjectRef.RefCapability()
 	}
 }
 
@@ -578,16 +600,15 @@ func (o *object) maybeRecordRead(ignoreWritten bool) error {
 	if !state.write {
 		state.curValue = valueRef.value
 		refs := make([]ObjectRef, len(valueRef.references))
-		var err error
 		for idx, rc := range valueRef.references {
 			if rc.vUUId != nil {
-				objRef := &refs[idx]
-				objRef.capability = rc.capability
-				objRef.object = &object{id: rc.vUUId}
-				*objRef, err = state.txn.GetObject(*objRef)
+				obj, err := state.txn.getObject(rc.vUUId, true)
 				if err != nil {
 					return err
 				}
+				objRef := &refs[idx]
+				objRef.object = obj
+				objRef.capability = rc.capability
 			}
 		}
 		state.curObjectRefs = refs
@@ -716,7 +737,7 @@ func (o *object) checkExpired() error {
 }
 
 func (o *object) checkCanRead() error {
-	switch o.Capability() {
+	switch o.ObjectRef.RefCapability() {
 	case Read, ReadWrite:
 		return nil
 	default:
@@ -725,8 +746,7 @@ func (o *object) checkCanRead() error {
 }
 
 func (o *object) checkCanWrite() error {
-	fmt.Printf("Testing CanWrite on %v (%p) (%v)\n", o.id, o, o.Capability())
-	switch o.Capability() {
+	switch o.ObjectRef.RefCapability() {
 	case Write, ReadWrite:
 		return nil
 	default:

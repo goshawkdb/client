@@ -48,7 +48,7 @@ func (c *cache) SetRoots(roots map[string]*refCap) {
 }
 
 func (c *cache) updateFromTxnCommit(txn *msgs.ClientTxn, txnId *common.TxnId) {
-	fmt.Println("Updating from commit")
+	// fmt.Println("Updating from commit")
 	actions := txn.Actions()
 	c.Lock()
 	defer c.Unlock()
@@ -59,15 +59,15 @@ func (c *cache) updateFromTxnCommit(txn *msgs.ClientTxn, txnId *common.TxnId) {
 		case msgs.CLIENTACTION_WRITE:
 			write := action.Write()
 			refs := write.References()
-			c.updateFromWrite(txnId, vUUId, write.Value(), &refs)
+			c.updateFromWrite(txnId, vUUId, write.Value(), &refs, false)
 		case msgs.CLIENTACTION_READWRITE:
 			rw := action.Readwrite()
 			refs := rw.References()
-			c.updateFromWrite(txnId, vUUId, rw.Value(), &refs)
+			c.updateFromWrite(txnId, vUUId, rw.Value(), &refs, false)
 		case msgs.CLIENTACTION_CREATE:
 			create := action.Create()
 			refs := create.References()
-			c.updateFromWrite(txnId, vUUId, create.Value(), &refs)
+			c.updateFromWrite(txnId, vUUId, create.Value(), &refs, true)
 		case msgs.CLIENTACTION_READ:
 			// do nothing
 		}
@@ -75,7 +75,7 @@ func (c *cache) updateFromTxnCommit(txn *msgs.ClientTxn, txnId *common.TxnId) {
 }
 
 func (c *cache) updateFromTxnAbort(updates *msgs.ClientUpdate_List) []*common.VarUUId {
-	fmt.Println("Updating from abort")
+	// fmt.Println("Updating from abort")
 	modifiedVars := make([]*common.VarUUId, 0, updates.Len())
 	c.Lock()
 	defer c.Unlock()
@@ -96,7 +96,7 @@ func (c *cache) updateFromTxnAbort(updates *msgs.ClientUpdate_List) []*common.Va
 				// version TxnId).
 				write := action.Write()
 				refs := write.References()
-				if c.updateFromWrite(txnId, vUUId, write.Value(), &refs) {
+				if c.updateFromWrite(txnId, vUUId, write.Value(), &refs, false) {
 					modifiedVars = append(modifiedVars, vUUId)
 				}
 			default:
@@ -104,7 +104,7 @@ func (c *cache) updateFromTxnAbort(updates *msgs.ClientUpdate_List) []*common.Va
 			}
 		}
 	}
-	//fmt.Println(".")
+	// fmt.Println(".")
 	return modifiedVars
 }
 
@@ -121,7 +121,7 @@ func (c *cache) updateFromDelete(vUUId *common.VarUUId, txnId *common.TxnId) {
 	}
 }
 
-func (c *cache) updateFromWrite(txnId *common.TxnId, vUUId *common.VarUUId, value []byte, refs *msgs.ClientVarIdPos_List) bool {
+func (c *cache) updateFromWrite(txnId *common.TxnId, vUUId *common.VarUUId, value []byte, refs *msgs.ClientVarIdPos_List, created bool) bool {
 	vr, found := c.m[*vUUId]
 	references := make([]refCap, refs.Len())
 	switch {
@@ -132,6 +132,9 @@ func (c *cache) updateFromWrite(txnId *common.TxnId, vUUId *common.VarUUId, valu
 	default:
 		vr = &valueRef{}
 		c.m[*vUUId] = vr
+	}
+	if created {
+		vr.capability = common.MaxCapability
 	}
 	// fmt.Printf("%v updated (%v -> %v)\n", vUUId, vr.version, txnId)
 	vr.references = references
@@ -152,6 +155,6 @@ func (c *cache) updateFromWrite(txnId *common.TxnId, vUUId *common.VarUUId, valu
 			}
 		}
 	}
-	fmt.Printf("%v@%v (%v)\n   (-> %v)\n", vUUId, txnId, value, references)
+	// fmt.Printf("%v@%v (%v)\n   (-> %v)\n", vUUId, txnId, value, references)
 	return found
 }
