@@ -1,7 +1,7 @@
 package client
 
 import (
-	// "fmt"
+	"fmt"
 	"goshawkdb.io/common"
 	msgs "goshawkdb.io/common/capnp"
 	"log"
@@ -10,6 +10,7 @@ import (
 
 type valueRef struct {
 	version    *common.TxnId
+	capability *common.Capability
 	value      []byte
 	references []refCap
 }
@@ -17,6 +18,10 @@ type valueRef struct {
 type refCap struct {
 	vUUId      *common.VarUUId
 	capability *common.Capability
+}
+
+func (rc refCap) String() string {
+	return fmt.Sprintf("%v(%v)", rc.vUUId, rc.capability)
 }
 
 type cache struct {
@@ -36,7 +41,14 @@ func (c *cache) Get(vUUId *common.VarUUId) *valueRef {
 	return c.m[*vUUId]
 }
 
+func (c *cache) SetRoots(roots map[string]*refCap) {
+	for _, rc := range roots {
+		c.m[*rc.vUUId] = &valueRef{capability: rc.capability}
+	}
+}
+
 func (c *cache) updateFromTxnCommit(txn *msgs.ClientTxn, txnId *common.TxnId) {
+	fmt.Println("Updating from commit")
 	actions := txn.Actions()
 	c.Lock()
 	defer c.Unlock()
@@ -63,6 +75,7 @@ func (c *cache) updateFromTxnCommit(txn *msgs.ClientTxn, txnId *common.TxnId) {
 }
 
 func (c *cache) updateFromTxnAbort(updates *msgs.ClientUpdate_List) []*common.VarUUId {
+	fmt.Println("Updating from abort")
 	modifiedVars := make([]*common.VarUUId, 0, updates.Len())
 	c.Lock()
 	defer c.Unlock()
@@ -96,9 +109,11 @@ func (c *cache) updateFromTxnAbort(updates *msgs.ClientUpdate_List) []*common.Va
 }
 
 func (c *cache) updateFromDelete(vUUId *common.VarUUId, txnId *common.TxnId) {
-	if vr, found := c.m[*vUUId]; found && vr.version.Compare(txnId) != common.EQ {
+	if vr, found := c.m[*vUUId]; found && vr.version != nil && vr.version.Compare(txnId) != common.EQ {
 		// fmt.Printf("%v removed from cache (req ver: %v; found ver: %v)\n", vUUId, txnId, vr.version)
-		delete(c.m, *vUUId)
+		vr.version = nil
+		vr.value = nil
+		vr.references = nil
 	} else if found {
 		log.Fatal("Divergence discovered on deletion of ", vUUId, ": server thinks we don't have ", txnId, " but we do!")
 	} else {
@@ -128,7 +143,15 @@ func (c *cache) updateFromWrite(txnId *common.TxnId, vUUId *common.VarUUId, valu
 			rc := &references[idz]
 			rc.vUUId = common.MakeVarUUId(varId)
 			rc.capability = common.NewCapability(ref.Capability())
+			vr, found := c.m[*rc.vUUId]
+			if found {
+				vr.capability = vr.capability.Union(rc.capability)
+			} else {
+				vr = &valueRef{capability: rc.capability}
+				c.m[*rc.vUUId] = vr
+			}
 		}
 	}
+	fmt.Printf("%v@%v (%v)\n   (-> %v)\n", vUUId, txnId, value, references)
 	return found
 }

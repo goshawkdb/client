@@ -521,6 +521,7 @@ func (cash *connectionAwaitServerHandshake) start() (bool, error) {
 		cash.namespace = make([]byte, common.KeyLen)
 		copy(cash.namespace[8:], server.Namespace())
 		cash.lock.Unlock()
+		cash.cache.SetRoots(roots)
 		cash.nextState()
 		return false, nil
 

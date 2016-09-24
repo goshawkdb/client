@@ -390,7 +390,6 @@ func (txn *Txn) GetObject(objRef ObjectRef) (ObjectRef, error) {
 
 func (txn *Txn) getObject(objRef ObjectRef, addToTxn bool) ObjectRef {
 	if obj, found := txn.objs[*objRef.id]; found {
-		obj.capability = obj.capability.Union(objRef.capability)
 		return obj.ObjectRef
 	}
 
@@ -400,12 +399,16 @@ func (txn *Txn) getObject(objRef ObjectRef, addToTxn bool) ObjectRef {
 				obj.state = obj.state.clone(txn)
 				txn.objs[*obj.id] = obj.object
 			}
-			obj.capability = obj.capability.Union(objRef.capability)
 			return obj.ObjectRef
 		}
 	}
 
 	if addToTxn {
+		valueRef := txn.cache.Get(objRef.id)
+		if valueRef == nil {
+			fmt.Printf("No such Object: %v\n", objRef.id)
+			return ObjectRef{}
+		}
 		// Can't reuse objRef.object because it could be from a different
 		// connection. Obviously this could be abused to extend
 		// capabilities, but the server enforces them ultimately.
@@ -415,8 +418,9 @@ func (txn *Txn) getObject(objRef ObjectRef, addToTxn bool) ObjectRef {
 		}
 		obj.ObjectRef = ObjectRef{
 			object:     obj,
-			capability: objRef.capability,
+			capability: valueRef.capability,
 		}
+		fmt.Printf("%v created new with %v\n", obj.id, obj.capability)
 		txn.objs[*obj.id] = obj
 		obj.state = &objectState{object: obj, txn: txn}
 		return obj.ObjectRef
@@ -554,7 +558,7 @@ func (o *object) maybeRecordRead(ignoreWritten bool) error {
 		return nil
 	}
 	valueRef := state.txn.cache.Get(o.id)
-	if valueRef == nil {
+	if valueRef == nil || valueRef.version == nil {
 		modifiedVars, elapsed, err := loadVar(o.id, o.conn)
 		if err != nil {
 			return err
@@ -563,7 +567,7 @@ func (o *object) maybeRecordRead(ignoreWritten bool) error {
 			return Restart
 		}
 		valueRef = state.txn.cache.Get(o.id)
-		if valueRef == nil {
+		if valueRef == nil || valueRef.version == nil {
 			return fmt.Errorf("Loading var %v failed to find value / update cache", o.id)
 		}
 		// log.Println(o.state.txn, "load", o.id, "->", valueRef.version, modifiedVars)
@@ -721,6 +725,7 @@ func (o *object) checkCanRead() error {
 }
 
 func (o *object) checkCanWrite() error {
+	fmt.Printf("Testing CanWrite on %v (%p) (%v)\n", o.id, o, o.Capability())
 	switch o.Capability() {
 	case Write, ReadWrite:
 		return nil
