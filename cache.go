@@ -123,6 +123,7 @@ func (c *cache) updateFromDelete(vUUId *common.VarUUId, txnId *common.TxnId) {
 
 func (c *cache) updateFromWrite(txnId *common.TxnId, vUUId *common.VarUUId, value []byte, refs *msgs.ClientVarIdPos_List, created bool) bool {
 	vr, found := c.m[*vUUId]
+	updated := found && vr.version != nil
 	references := make([]refCap, refs.Len())
 	switch {
 	case found && vr.version.Compare(txnId) == common.EQ:
@@ -156,5 +157,5 @@ func (c *cache) updateFromWrite(txnId *common.TxnId, vUUId *common.VarUUId, valu
 		}
 	}
 	// fmt.Printf("%v@%v (%v)\n   (-> %v)\n", vUUId, txnId, value, references)
-	return found
+	return updated
 }

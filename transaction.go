@@ -601,15 +601,13 @@ func (o *object) maybeRecordRead(ignoreWritten bool) error {
 		state.curValue = valueRef.value
 		refs := make([]ObjectRef, len(valueRef.references))
 		for idx, rc := range valueRef.references {
-			if rc.vUUId != nil {
-				obj, err := state.txn.getObject(rc.vUUId, true)
-				if err != nil {
-					return err
-				}
-				objRef := &refs[idx]
-				objRef.object = obj
-				objRef.capability = rc.capability
+			obj, err := state.txn.getObject(rc.vUUId, true)
+			if err != nil {
+				return err
 			}
+			objRef := &refs[idx]
+			objRef.object = obj
+			objRef.capability = rc.capability
 		}
 		state.curObjectRefs = refs
 	}
