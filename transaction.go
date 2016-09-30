@@ -321,10 +321,10 @@ func (txn *Txn) submitToServer() (bool, error) {
 
 // Returns the database Root Objects. The Root Objects for each client
 // are defined by the cluster configuration represent the roots of the
-// object graphs. For an object to be reachable, there must be a path
-// to it from a Root Object. If an error is returned, the current
-// transaction should immediately be restarted (return the error
-// Restart)
+// object graphs. For an object to be reachable, there must be a
+// readable path to it from a Root Object. If an error is returned,
+// the current transaction should immediately be restarted (return the
+// error Restart)
 func (txn *Txn) GetRootObjects() (map[string]ObjectRef, error) {
 	roots := make(map[string]ObjectRef, len(txn.roots))
 	for name, rc := range txn.roots {
@@ -346,7 +346,8 @@ func (txn *Txn) GetRootObjects() (map[string]ObjectRef, error) {
 // either after calling this method, your modifications will not take
 // effect. If the error is Restart, you should return Restart as an
 // error in the transaction. The ObjectRef returned will contain the
-// ReadWrite capability.
+// ReadWrite capability and the client is granted the full ReadWrite
+// capability on the object for the lifetime of the client connection.
 func (txn *Txn) CreateObject(value []byte, references ...ObjectRef) (ObjectRef, error) {
 	if txn.resetInProgress {
 		return ObjectRef{}, Restart
@@ -467,15 +468,15 @@ const (
 	ReadWrite Capability = iota
 )
 
-// ObjectRef represents a pointer to an object in the database,
-// combined with a capability to act on that object. ObjectRefs are
-// linked to Connections: if you're using multiple Connections, it is
-// not permitted to use the same ObjectRef in both connections; you
-// can either navigate to the same object in both connections or once
-// that is done in each connection, you can use GetObject to get a new
-// ObjectRef to the same object in the other connection. Within the
-// same Connection, and within nested transactions, ObjectRefs may be
-// freely reused.
+// ObjectRef represents a reference (or pointer) to an object in the
+// database, combined with a capability to act on that
+// object. ObjectRefs are linked to Connections: if you're using
+// multiple Connections, it is not permitted to use the same ObjectRef
+// in both connections; you can either navigate to the same object in
+// both connections or once that is done in each connection, you can
+// use GetObject to get a new ObjectRef to the same object in the
+// other connection. Within the same Connection, and within nested
+// transactions, ObjectRefs may be freely reused.
 type ObjectRef struct {
 	*object
 	capability *common.Capability
