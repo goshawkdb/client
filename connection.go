@@ -27,7 +27,7 @@ type Connection struct {
 	nextVUUId         uint64
 	nextTxnId         uint64
 	namespace         []byte
-	rootVUUIds        map[string]*common.VarUUId
+	rootVUUIds        map[string]*refCap
 	socket            net.Conn
 	cache             *cache
 	cellTail          *cc.ChanCellTail
@@ -119,16 +119,17 @@ func NewConnection(hostPort string, clientCertAndKeyPEM, clusterCertPEM []byte) 
 // the function is invoked potentially several times until it
 // completes successfully: either committing or choosing to abort. The
 // function should therefore be referentially transparent. Returning
-// any non-nil error will cause the transaction to be aborted with the
-// only exception that returning Restart when the transaction has
-// identified a restart is required will cause the transaction to be
-// immediately restarted.
+// any non-nil error will cause the transaction to be aborted. The
+// only exception to this rule is that returning Restart when the
+// transaction has identified a restart is required will cause the
+// transaction to be immediately restarted (methods on ObjectRef will
+// return Restart as necessary).
 //
-// The function final results are returned by this function, along
+// The function's final results are returned by this method, along
 // with statistics regarding how the transaction proceeded.
 //
 // This function automatically detects and creates nested
-// transactions: it is perfectly safe and expected to call
+// transactions: it is perfectly safe (and expected) to call
 // RunTransaction from within a transaction.
 func (conn *Connection) RunTransaction(fun func(*Txn) (interface{}, error)) (interface{}, *Stats, error) {
 	roots := conn.rootVarUUIds()
@@ -147,7 +148,7 @@ func (conn *Connection) RunTransaction(fun func(*Txn) (interface{}, error)) (int
 	return res, stats, err
 }
 
-func (conn *Connection) rootVarUUIds() map[string]*common.VarUUId {
+func (conn *Connection) rootVarUUIds() map[string]*refCap {
 	conn.lock.RLock()
 	defer conn.lock.RUnlock()
 	return conn.rootVUUIds
@@ -507,16 +508,20 @@ func (cash *connectionAwaitServerHandshake) start() (bool, error) {
 		if l == 0 {
 			return false, fmt.Errorf("Cluster is not yet formed; Root objects have not been created.")
 		}
-		roots := make(map[string]*common.VarUUId, l)
+		roots := make(map[string]*refCap, l)
 		for idx := 0; idx < l; idx++ {
 			rootCap := rootsCap.At(idx)
-			roots[rootCap.Name()] = common.MakeVarUUId(rootCap.VarId())
+			roots[rootCap.Name()] = &refCap{
+				vUUId:      common.MakeVarUUId(rootCap.VarId()),
+				capability: common.NewCapability(rootCap.Capability()),
+			}
 		}
 		cash.lock.Lock()
 		cash.rootVUUIds = roots
 		cash.namespace = make([]byte, common.KeyLen)
 		copy(cash.namespace[8:], server.Namespace())
 		cash.lock.Unlock()
+		cash.cache.SetRoots(roots)
 		cash.nextState()
 		return false, nil
 
