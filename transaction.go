@@ -549,6 +549,14 @@ func (objRef ObjectRef) GrantCapability(capability Capability) ObjectRef {
 	}
 }
 
+// Returns the identifier of the object to which this reference
+// refers. From this you can convert to a byte[] which can be useful
+// for example when using the collections library and you wish to use
+// objects as keys.
+func (objRef ObjectRef) Id() *common.VarUUId {
+	return common.MakeVarUUId(objRef.id[:])
+}
+
 type objectState struct {
 	*object
 	parentState   *objectState
