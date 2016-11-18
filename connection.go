@@ -27,7 +27,7 @@ type Connection struct {
 	nextVUUId         uint64
 	nextTxnId         uint64
 	namespace         []byte
-	rootVUUId         *common.VarUUId
+	rootVUUIds        map[string]*refCap
 	socket            net.Conn
 	cache             *cache
 	cellTail          *cc.ChanCellTail
@@ -74,10 +74,7 @@ func NewConnection(hostPort string, clientCertAndKeyPEM, clusterCertPEM []byte) 
 	if err != nil {
 		return nil, err
 	}
-	if err = socket.SetKeepAlive(true); err != nil {
-		return nil, err
-	}
-	if err = socket.SetKeepAlivePeriod(time.Second); err != nil {
+	if err = common.ConfigureSocket(socket); err != nil {
 		return nil, err
 	}
 
@@ -122,25 +119,26 @@ func NewConnection(hostPort string, clientCertAndKeyPEM, clusterCertPEM []byte) 
 // the function is invoked potentially several times until it
 // completes successfully: either committing or choosing to abort. The
 // function should therefore be referentially transparent. Returning
-// any non-nil error will cause the transaction to be aborted with the
-// only exception that returning Restart when the transaction has
-// identified a restart is required will cause the transaction to be
-// immediately restarted.
+// any non-nil error will cause the transaction to be aborted. The
+// only exception to this rule is that returning Restart when the
+// transaction has identified a restart is required will cause the
+// transaction to be immediately restarted (methods on ObjectRef will
+// return Restart as necessary).
 //
-// The function final results are returned by this function, along
+// The function's final results are returned by this method, along
 // with statistics regarding how the transaction proceeded.
 //
 // This function automatically detects and creates nested
-// transactions: it is perfectly safe and expected to call
+// transactions: it is perfectly safe (and expected) to call
 // RunTransaction from within a transaction.
 func (conn *Connection) RunTransaction(fun func(*Txn) (interface{}, error)) (interface{}, *Stats, error) {
-	root := conn.rootVarUUId()
-	if root == nil {
-		return nil, nil, fmt.Errorf("Unable to start transaction: root object not ready")
+	roots := conn.rootVarUUIds()
+	if roots == nil {
+		return nil, nil, fmt.Errorf("Unable to start transaction: root objects not ready")
 	}
 	var oldTxn *Txn
 	conn.lock.Lock()
-	txn := newTxn(fun, conn, conn.cache, root, conn.curTxn)
+	txn := newTxn(fun, conn, conn.cache, roots, conn.curTxn)
 	conn.curTxn, oldTxn = txn, conn.curTxn
 	conn.lock.Unlock()
 	res, stats, err := txn.run()
@@ -150,10 +148,10 @@ func (conn *Connection) RunTransaction(fun func(*Txn) (interface{}, error)) (int
 	return res, stats, err
 }
 
-func (conn *Connection) rootVarUUId() *common.VarUUId {
+func (conn *Connection) rootVarUUIds() map[string]*refCap {
 	conn.lock.RLock()
 	defer conn.lock.RUnlock()
-	return conn.rootVUUId
+	return conn.rootVUUIds
 }
 
 func (conn *Connection) nextVarUUId() *common.VarUUId {
@@ -166,27 +164,29 @@ func (conn *Connection) nextVarUUId() *common.VarUUId {
 }
 
 type connectionMsg interface {
-	connectionMsgWitness()
+	witness() connectionMsg
 }
 
-type connectionMsgShutdown struct{}
+type connectionMsgBasic struct{}
 
-func (cms *connectionMsgShutdown) connectionMsgWitness() {}
-func (cms *connectionMsgShutdown) Error() string {
+func (cmb connectionMsgBasic) witness() connectionMsg { return cmb }
+
+type connectionMsgShutdown struct{ connectionMsgBasic }
+
+func (cms connectionMsgShutdown) Error() string {
 	return "Connection Shutdown"
 }
-
-var connectionMsgShutdownInst = &connectionMsgShutdown{}
 
 // Shutdown the connection. This will block until the connection is
 // closed.
 func (conn *Connection) Shutdown() {
-	if conn.enqueueQuery(connectionMsgShutdownInst) {
+	if conn.enqueueQuery(connectionMsgShutdown{}) {
 		conn.cellTail.Wait()
 	}
 }
 
 type connectionMsgSyncQuery struct {
+	connectionMsgBasic
 	resultChan chan struct{}
 	err        error
 }
@@ -195,14 +195,12 @@ func (cmsq *connectionMsgSyncQuery) init() {
 	cmsq.resultChan = make(chan struct{})
 }
 
-type connectionMsgAwaitReady connectionMsgSyncQuery
-
-func (cmwr *connectionMsgAwaitReady) connectionMsgWitness() {}
+type connectionMsgAwaitReady struct{ connectionMsgSyncQuery }
 
 func (conn *Connection) awaitReady() error {
-	query := new(connectionMsgSyncQuery)
+	query := &connectionMsgAwaitReady{}
 	query.init()
-	if conn.enqueueSyncQuery((*connectionMsgAwaitReady)(query), query.resultChan) {
+	if conn.enqueueSyncQuery(query, query.resultChan) {
 		return query.err
 	} else {
 		return nil
@@ -215,8 +213,6 @@ type connectionMsgTxn struct {
 	outcome      *msgs.ClientTxnOutcome
 	modifiedVars []*common.VarUUId
 }
-
-func (cmt *connectionMsgTxn) connectionMsgWitness() {}
 
 func (cmt *connectionMsgTxn) setOutcomeError(outcome *msgs.ClientTxnOutcome, modifiedVars []*common.VarUUId, err error) bool {
 	select {
@@ -237,7 +233,7 @@ func (conn *Connection) submitTransaction(txn *msgs.ClientTxn) (*msgs.ClientTxnO
 	if conn.enqueueSyncQuery(query, query.resultChan) {
 		return query.outcome, query.modifiedVars, query.err
 	} else {
-		return nil, nil, connectionMsgShutdownInst
+		return nil, nil, connectionMsgShutdown{}
 	}
 }
 
@@ -298,14 +294,14 @@ func (conn *Connection) handleMsg(msg connectionMsg) (terminate bool, err error)
 	switch msgT := msg.(type) {
 	case *connectionMsgTxn:
 		err = conn.submitTxn(msgT)
-	case *connectionReadError:
+	case connectionReadMessage:
+		err = conn.handleMsgFromServer((msgs.ClientMessage)(msgT))
+	case connectionReadError:
 		conn.reader = nil
 		err = msgT.error
-	case *connectionReadMessage:
-		err = conn.handleMsgFromServer((*msgs.ClientMessage)(msgT))
 	case *connectionBeater:
 		err = conn.beat()
-	case *connectionMsgShutdown:
+	case connectionMsgShutdown:
 		terminate = true
 		conn.currentState = nil
 	case *connectionMsgAwaitReady:
@@ -325,7 +321,7 @@ func (conn *Connection) handleShutdown(err error) {
 	e := fmt.Errorf("Connection shutting down")
 	if conn.liveTxn != nil {
 		if !conn.liveTxn.setOutcomeError(nil, nil, e) {
-			log.Println("Internal Logic Failure when closing outstanding live txn")
+			panic("Internal Logic Failure when closing outstanding live txn")
 		}
 		conn.liveTxn = nil
 	}
@@ -358,8 +354,6 @@ func (conn *Connection) nextState() {
 		conn.currentState = &conn.connectionAwaitServerHandshake
 	case &conn.connectionAwaitServerHandshake:
 		conn.currentState = &conn.connectionRun
-	case &conn.connectionRun:
-		conn.currentState = nil
 	}
 }
 
@@ -370,6 +364,7 @@ type connectionAwaitHandshake struct {
 }
 
 func (cah *connectionAwaitHandshake) connectionStateMachineComponentWitness() {}
+func (cah *connectionAwaitHandshake) String() string                          { return "ConnectionAwaitHandshake" }
 
 func (cah *connectionAwaitHandshake) init(conn *Connection) {
 	cah.Connection = conn
@@ -392,7 +387,16 @@ func (cah *connectionAwaitHandshake) start() (bool, error) {
 		if hello := msgs.ReadRootHello(seg); cah.verifyHello(&hello) {
 			cah.nextState()
 		} else {
-			return false, fmt.Errorf("Received erroneous hello from server")
+			product := hello.Product()
+			if l := len(common.ProductName); len(product) > l {
+				product = product[:l] + "..."
+			}
+			version := hello.Version()
+			if l := len(common.ProductVersion); len(version) > l {
+				version = version[:l] + "..."
+			}
+			return false, fmt.Errorf("Received erroneous hello from peer: received product name '%s' (expected '%s'), product version '%s' (expected '%s')",
+				product, common.ProductName, version, common.ProductVersion)
 		}
 	} else {
 		return false, err
@@ -417,8 +421,19 @@ func (cah *connectionAwaitHandshake) verifyHello(hello *msgs.Hello) bool {
 }
 
 func (cah *connectionAwaitHandshake) send(msg []byte) error {
-	_, err := cah.socket.Write(msg)
-	return err
+	l := len(msg)
+	for l > 0 {
+		switch w, err := cah.socket.Write(msg); {
+		case err != nil:
+			return err
+		case w == l:
+			return nil
+		default:
+			msg = msg[w:]
+			l -= w
+		}
+	}
+	return nil
 }
 
 func (cah *connectionAwaitHandshake) readOne() (*capn.Segment, error) {
@@ -459,6 +474,9 @@ func (cash *connectionAwaitServerHandshake) start() (bool, error) {
 	}
 
 	socket := tls.Client(cash.socket, config)
+	if err := socket.SetDeadline(time.Time{}); err != nil {
+		return false, err
+	}
 	cash.socket = socket
 
 	if err := socket.Handshake(); err != nil {
@@ -485,17 +503,25 @@ func (cash *connectionAwaitServerHandshake) start() (bool, error) {
 
 	if seg, err := cash.readOne(); err == nil {
 		server := msgs.ReadRootHelloClientFromServer(seg)
-		rootVarUUId := server.RootId()
-		if l := len(rootVarUUId); l == 0 {
-			return false, fmt.Errorf("Cluster is not yet formed; Root object has not been created.")
-		} else if l != common.KeyLen {
-			return false, fmt.Errorf("Root object VarUUId is of wrong length!")
+		rootsCap := server.Roots()
+		l := rootsCap.Len()
+		if l == 0 {
+			return false, fmt.Errorf("Cluster is not yet formed; Root objects have not been created.")
+		}
+		roots := make(map[string]*refCap, l)
+		for idx := 0; idx < l; idx++ {
+			rootCap := rootsCap.At(idx)
+			roots[rootCap.Name()] = &refCap{
+				vUUId:      common.MakeVarUUId(rootCap.VarId()),
+				capability: common.NewCapability(rootCap.Capability()),
+			}
 		}
 		cash.lock.Lock()
-		cash.rootVUUId = common.MakeVarUUId(rootVarUUId)
+		cash.rootVUUIds = roots
 		cash.namespace = make([]byte, common.KeyLen)
 		copy(cash.namespace[8:], server.Namespace())
 		cash.lock.Unlock()
+		cash.cache.SetRoots(roots)
 		cash.nextState()
 		return false, nil
 
@@ -518,6 +544,8 @@ type connectionRun struct {
 }
 
 func (cr *connectionRun) connectionStateMachineComponentWitness() {}
+func (cr *connectionRun) String() string                          { return "ConnectionRun" }
+
 func (cr *connectionRun) init(conn *Connection) {
 	cr.Connection = conn
 }
@@ -572,7 +600,7 @@ func (cr *connectionRun) sendMessage(msg *msgs.ClientMessage) error {
 	return nil
 }
 
-func (cr *connectionRun) handleMsgFromServer(msg *msgs.ClientMessage) error {
+func (cr *connectionRun) handleMsgFromServer(msg msgs.ClientMessage) error {
 	if cr.currentState != cr {
 		return nil
 	}
@@ -581,8 +609,7 @@ func (cr *connectionRun) handleMsgFromServer(msg *msgs.ClientMessage) error {
 	case msgs.CLIENTMESSAGE_HEARTBEAT:
 		// do nothing
 	case msgs.CLIENTMESSAGE_CLIENTTXNOUTCOME:
-		outcome := msg.ClientTxnOutcome()
-		return cr.handleTxnOutcome(&outcome)
+		return cr.handleTxnOutcome(msg.ClientTxnOutcome())
 	default:
 		return fmt.Errorf("Received unexpected message from server: %v", which)
 	}
@@ -592,13 +619,13 @@ func (cr *connectionRun) handleMsgFromServer(msg *msgs.ClientMessage) error {
 func (cr *connectionRun) submitTxn(txnMsg *connectionMsgTxn) error {
 	if cr.currentState != cr {
 		if !txnMsg.setOutcomeError(nil, nil, fmt.Errorf("Connection in wrong state: %v", cr.currentState)) {
-			return fmt.Errorf("Live txn already closed")
+			return fmt.Errorf("Connection in wrong state: %v", cr.currentState)
 		}
 		return nil
 	}
 	if cr.liveTxn != nil {
 		if !txnMsg.setOutcomeError(nil, nil, fmt.Errorf("Existing live txn")) {
-			return fmt.Errorf("Live txn already closed")
+			return fmt.Errorf("Existing live txn")
 		}
 		return nil
 	}
@@ -616,7 +643,7 @@ func (cr *connectionRun) submitTxn(txnMsg *connectionMsgTxn) error {
 	}
 }
 
-func (cr *connectionRun) handleTxnOutcome(outcome *msgs.ClientTxnOutcome) error {
+func (cr *connectionRun) handleTxnOutcome(outcome msgs.ClientTxnOutcome) error {
 	txnId := common.MakeTxnId(outcome.Id())
 	if cr.liveTxn == nil {
 		return fmt.Errorf("Received txn outcome for unknown txn: %v", txnId)
@@ -641,7 +668,7 @@ func (cr *connectionRun) handleTxnOutcome(outcome *msgs.ClientTxnOutcome) error 
 	case msgs.CLIENTTXNOUTCOME_ERROR:
 		err = fmt.Errorf(outcome.Error())
 	}
-	if !cr.liveTxn.setOutcomeError(outcome, modifiedVars, err) {
+	if !cr.liveTxn.setOutcomeError(&outcome, modifiedVars, err) {
 		return fmt.Errorf("Live txn already closed")
 	}
 	cr.liveTxn = nil
@@ -675,18 +702,11 @@ func (cr *connectionRun) maybeStopBeater() {
 func (cr *connectionRun) maybeStopReaderAndCloseSocket() {
 	if cr.reader != nil {
 		close(cr.reader.terminate)
-		if cr.socket != nil {
-			if err := cr.socket.Close(); err != nil {
-				log.Println(err)
-			}
-		}
 		cr.reader.terminated.Wait()
 		cr.reader = nil
-		cr.socket = nil
-	} else if cr.socket != nil {
-		if err := cr.socket.Close(); err != nil {
-			log.Println(err)
-		}
+	}
+	if cr.socket != nil {
+		cr.socket.Close()
 		cr.socket = nil
 	}
 }
@@ -729,7 +749,7 @@ func (cb *connectionBeater) beat() {
 	}
 }
 
-func (cb *connectionBeater) connectionMsgWitness() {}
+func (cb *connectionBeater) witness() connectionMsg { return cb }
 
 // Reader
 
@@ -758,11 +778,11 @@ func (cr *connectionReader) read() {
 		default:
 			if seg, err := cr.readOne(); err == nil {
 				msg := msgs.ReadRootClientMessage(seg)
-				if !cr.enqueueQuery((*connectionReadMessage)(&msg)) {
+				if !cr.enqueueQuery(connectionReadMessage(msg)) {
 					return
 				}
 			} else {
-				cr.enqueueQuery(&connectionReadError{err})
+				cr.enqueueQuery(connectionReadError{err})
 				return
 			}
 		}
@@ -771,10 +791,10 @@ func (cr *connectionReader) read() {
 
 type connectionReadMessage msgs.ClientMessage
 
-func (crm *connectionReadMessage) connectionMsgWitness() {}
+func (crm connectionReadMessage) witness() connectionMsg { return crm }
 
 type connectionReadError struct {
 	error
 }
 
-func (cre *connectionReadError) connectionMsgWitness() {}
+func (cre connectionReadError) witness() connectionMsg { return cre }
