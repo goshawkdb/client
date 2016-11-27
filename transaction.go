@@ -496,6 +496,9 @@ func (objRef ObjectRef) String() string {
 
 // Reveal which capabilities this ObjectRef contains.
 func (objRef ObjectRef) RefCapability() Capability {
+	if objRef.capability == nil {
+		panic("Nil capability within objRef")
+	}
 	switch objRef.capability.Which() {
 	case msgs.CAPABILITY_NONE:
 		return None
@@ -554,6 +557,9 @@ func (objRef ObjectRef) GrantCapability(capability Capability) ObjectRef {
 // for example when using the collections library and you wish to use
 // objects as keys.
 func (objRef ObjectRef) Id() *common.VarUUId {
+	if objRef.object == nil {
+		panic("Nil object within objRef")
+	}
 	return common.MakeVarUUId(objRef.id[:])
 }
 
@@ -628,6 +634,9 @@ func (o *object) maybeRecordRead(ignoreWritten bool) error {
 // error in the transaction. This method will error if you do not have
 // the Read capability for this object.
 func (o *object) Version() (*common.TxnId, error) {
+	if o == nil {
+		return nil, errors.New("Cannot call Version() on a nil object")
+	}
 	if err := o.checkCanRead(); err != nil {
 		return nil, err
 	}
@@ -650,6 +659,9 @@ func (o *object) Version() (*common.TxnId, error) {
 // transaction. This method will error if you do not have the Read
 // capability for this object.
 func (o *object) Value() ([]byte, error) {
+	if o == nil {
+		return nil, errors.New("Cannot call Value() on a nil object")
+	}
 	if err := o.checkCanRead(); err != nil {
 		return nil, err
 	}
@@ -671,6 +683,9 @@ func (o *object) Value() ([]byte, error) {
 // error in the transaction. This method will error if you do not have
 // the Read capability for this object.
 func (o *object) References() ([]ObjectRef, error) {
+	if o == nil {
+		return nil, errors.New("Cannot call References() on a nil object")
+	}
 	if err := o.checkCanRead(); err != nil {
 		return nil, err
 	}
@@ -693,6 +708,9 @@ func (o *object) References() ([]ObjectRef, error) {
 // an error in the transaction. This method will error if you do not
 // have the Read capability for this object.
 func (o *object) ValueReferences() ([]byte, []ObjectRef, error) {
+	if o == nil {
+		return nil, nil, errors.New("Cannot call ValueReferences() on a nil object")
+	}
 	if err := o.checkCanRead(); err != nil {
 		return nil, nil, err
 	}
@@ -720,6 +738,9 @@ func (o *object) ValueReferences() ([]byte, []ObjectRef, error) {
 // transaction. This method will error if you do not have the Write
 // capability for this object.
 func (o *object) Set(value []byte, references ...ObjectRef) error {
+	if o == nil {
+		return errors.New("Cannot call Set() on a nil object")
+	}
 	if err := o.checkCanWrite(); err != nil {
 		return err
 	}
