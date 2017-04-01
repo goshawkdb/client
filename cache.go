@@ -109,8 +109,9 @@ func (c *cache) updateFromTxnAbort(updates *msgs.ClientUpdate_List) []*common.Va
 }
 
 func (c *cache) updateFromDelete(vUUId *common.VarUUId, txnId *common.TxnId) {
+	// fmt.Printf("%p: updateFromDelete for %v at %v\n", c, vUUId, txnId)
 	if vr, found := c.m[*vUUId]; found && vr.version != nil && vr.version.Compare(txnId) != common.EQ {
-		// fmt.Printf("%v removed from cache (req ver: %v; found ver: %v)\n", vUUId, txnId, vr.version)
+		// fmt.Printf("%p: %v removed from cache (req ver: %v; found ver: %v)\n", c, vUUId, txnId, vr.version)
 		vr.version = nil
 		vr.value = nil
 		vr.references = nil
@@ -137,7 +138,7 @@ func (c *cache) updateFromWrite(txnId *common.TxnId, vUUId *common.VarUUId, valu
 	if created {
 		vr.capability = common.MaxCapability
 	}
-	// fmt.Printf("%v updated (%v -> %v)\n", vUUId, vr.version, txnId)
+	// fmt.Printf("%p: %v updated (%v -> %v)\n", c, vUUId, vr.version, txnId)
 	vr.references = references
 	vr.version = txnId
 	vr.value = value

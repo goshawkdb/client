@@ -84,6 +84,7 @@ func newTxn(fun func(*Txn) (interface{}, error), conn *Connection, cache *cache,
 		t.stats = parent.stats
 		t.resetInProgress = parent.resetInProgress
 	}
+	// fmt.Printf("%p: newTxn %p (parent %p)\n", cache, t, parent)
 	return t
 }
 
@@ -95,60 +96,60 @@ func (txn *Txn) run() (interface{}, *Stats, error) {
 			if txn.parent == nil || !txn.parent.resetInProgress {
 				txn.resetInProgress = false
 			} else {
-				// log.Printf("%v refusing to start txn as resetInProgress\n", txn)
+				// fmt.Printf("%p refusing to start txn as resetInProgress\n", txn.cache, txn)
 				return nil, txn.stats, Restart
 			}
 		}
 		txn.resetObjects()
-		// log.Printf("%v starting fun\n", txn)
+		// fmt.Printf("%p, %p starting fun\n", txn.cache, txn)
 		result, err := txn.fun(txn)
-		// log.Printf("%v finished fun\n", txn)
+		// fmt.Printf("%p, %p finished fun\n", txn.cache, txn)
 
 		switch {
 		case err != nil && err != Restart:
-			// log.Printf("%v 1 returning %v %v\n", txn, result, err)
+			// fmt.Printf("%p, %p 1 returning %v %v\n", txn.cache, txn, result, err)
 			return nil, txn.stats, err
 		case txn.resetInProgress:
 			if txn.parent == nil || !txn.parent.resetInProgress {
-				// log.Printf("%v 2 resetInProgress, continuing\n", txn)
+				// fmt.Printf("%p, %p 2 resetInProgress, continuing\n", txn.cache, txn)
 				continue
 			} else {
-				// log.Printf("%v 3 resetInProgress, returning %v\n", txn, result)
+				// fmt.Printf("%p, %p 3 resetInProgress, returning %v\n", txn.cache, txn, result)
 				return nil, txn.stats, Restart
 			}
 		case result == Retry:
 			err = txn.submitRetryTransaction()
 			switch {
 			case err != nil:
-				// log.Printf("%v 4 retry, returning err %v\n", txn, err)
+				// fmt.Printf("%p, %p 4 retry, returning err %v\n", txn.cache, txn, err)
 				return nil, txn.stats, err
 			case txn.parent == nil:
-				// log.Printf("%v 5 retry, continuing\n", txn)
+				// fmt.Printf("%p, %p 5 retry, continuing\n", txn.cache, txn)
 				continue
 			default:
-				// log.Printf("%v 6 retry, returning\n", txn)
+				// fmt.Printf("%p, %p 6 retry, returning\n", txn.cache, txn)
 				return nil, txn.stats, Restart
 			}
 		case txn.parent == nil:
-			// log.Printf("%v 7 submitting to server\n", txn)
+			// fmt.Printf("%p, %p 7 submitting to server\n", txn.cache, txn)
 			start := time.Now()
 			rerun, err := txn.submitToServer()
 			txn.stats.Submissions = append(txn.stats.Submissions, time.Now().Sub(start))
 			switch {
 			case err != nil:
-				// log.Printf("%v 8 returning err %v\n", txn, err)
+				// fmt.Printf("%p, %p 8 returning err %v\n", txn.cache, txn, err)
 				return nil, txn.stats, err
 			case rerun:
-				// log.Printf("%v 9 continuing rerun\n", txn)
+				// fmt.Printf("%p, %p 9 continuing rerun\n", txn.cache, txn)
 				continue
 			default:
-				// log.Printf("%v 10 returning success %v\n", txn, result)
+				// fmt.Printf("%p, %p 10 returning success %v\n", txn.cache, txn, result)
 				return result, txn.stats, nil
 			}
 		default:
-			// log.Printf("%v 11 moving to parent\n", txn)
+			// fmt.Printf("%p, %p 11 moving to parent\n", txn.cache, txn)
 			txn.moveObjsToParent()
-			// log.Printf("%v 11 returning %v\n", txn, result)
+			// fmt.Printf("%p, %p 11 returning %v (parent is %p)\n", txn.cache, txn, result, txn.parent)
 			return result, txn.stats, nil
 		}
 	}
@@ -157,10 +158,10 @@ func (txn *Txn) run() (interface{}, *Stats, error) {
 func (txn *Txn) resetObjects() {
 	for vUUId, obj := range txn.objs {
 		if obj.state.txn == txn {
-			// log.Printf("%v resetting %v\n", txn, obj.id)
+			// fmt.Printf("%p, %p resetting %v\n", txn.cache, txn, obj.id)
 			obj.state = obj.state.parentState
 		}
-		// log.Printf("%v deleting %v\n", txn, obj.id)
+		// fmt.Printf("%p, %p deleting %v\n", txn.cache, txn, obj.id)
 		delete(txn.objs, vUUId)
 	}
 }
@@ -200,24 +201,24 @@ func (txn *Txn) submitRetryTransaction() error {
 
 func (txn *Txn) moveObjsToParent() {
 	parent := txn.parent
+	// fmt.Printf("%p: %p moveObjsToParent %p\n", txn.cache, txn, parent)
 	objs := parent.objs
 	for _, obj := range txn.objs {
 		state := obj.state
-		if obj.state.txn == txn {
-			state.txn = parent
-			if state.parentState != nil && state.parentState.txn == parent {
-				state.parentState = state.parentState.parentState
-			}
-			// log.Printf("%v Set %v state[%p] to %v\n", txn, obj.id, parent, state)
-			if _, found := objs[*obj.id]; !found {
-				// log.Printf("%v added to parent objs %v\n", txn, obj.id)
-				objs[*obj.id] = obj
-			}
+		state.txn = parent
+		if state.parentState != nil && state.parentState.txn == parent {
+			state.parentState = state.parentState.parentState
+		}
+		// fmt.Printf("%p: %p Set %v state[%p] to %v\n", txn.cache, txn, obj.id, parent, state)
+		if _, found := objs[*obj.id]; !found {
+			// fmt.Printf("%p: %p added to parent %p objs %v\n", txn.cache, txn, parent, obj.id)
+			objs[*obj.id] = obj
 		}
 	}
 }
 
 func (txn *Txn) varsUpdated(vUUIds []*common.VarUUId) bool {
+	// fmt.Printf("%p: in txn %p varsUpdated; parent= %p\n", txn.cache, txn, txn.parent)
 	switch {
 	case txn.parent != nil && txn.parent.varsUpdated(vUUIds):
 		txn.resetInProgress = true
@@ -226,9 +227,12 @@ func (txn *Txn) varsUpdated(vUUIds []*common.VarUUId) bool {
 		return true
 	default:
 		for _, vUUId := range vUUIds {
-			if obj, found := txn.objs[*vUUId]; found && obj.state.txn == txn && obj.state.read {
-				txn.resetInProgress = true
-				return true
+			if obj, found := txn.objs[*vUUId]; found {
+				// fmt.Printf("%p: found %v, r,w,c: %v %v %v, %p vs %p\n", txn.cache, vUUId, obj.state.read, obj.state.write, obj.state.create, obj.state.txn, txn)
+				if obj.state.read && obj.state.txn == txn {
+					txn.resetInProgress = true
+					return true
+				}
 			}
 		}
 		return false
@@ -236,7 +240,7 @@ func (txn *Txn) varsUpdated(vUUIds []*common.VarUUId) bool {
 }
 
 func (txn *Txn) submitToServer() (bool, error) {
-	// log.Println(txn, "Submitting to conn")
+	// fmt.Printf("%p: %p Submitting to conn\n", txn.cache, txn)
 	reads := make([]*objectState, 0, len(txn.objs))
 	writes := make([]*objectState, 0, len(txn.objs))
 	readwrites := make([]*objectState, 0, len(txn.objs))
@@ -260,7 +264,7 @@ func (txn *Txn) submitToServer() (bool, error) {
 		return false, nil
 	}
 
-	// log.Printf("%v r:%v; w:%v; rw:%v; c%v; ", txn, len(reads), len(writes), len(readwrites), len(creates))
+	// fmt.Printf("%p: %p r:%v; w:%v; rw:%v; c%v;\n", txn.cache, txn, len(reads), len(writes), len(readwrites), len(creates))
 
 	total := make([]*objectState, totalLen)
 	copy(total, reads)
@@ -313,6 +317,7 @@ func (txn *Txn) submitToServer() (bool, error) {
 	}
 	outcome, _, err := txn.conn.submitTransaction(&cTxn)
 	if err != nil {
+		// panic(err) // useful for debug
 		return false, err
 	}
 	txn.stats.TxnId = common.MakeTxnId(outcome.FinalId())
@@ -597,6 +602,7 @@ func (o *object) maybeRecordRead(ignoreWritten bool) error {
 	valueRef := state.txn.cache.Get(o.id)
 	if valueRef == nil || valueRef.version == nil {
 		modifiedVars, elapsed, err := loadVar(o.id, o.conn)
+		// fmt.Printf("%p: in txn %p; did load of %v; modified %v\n", state.txn.cache, state.txn, o.id, modifiedVars)
 		if err != nil {
 			return err
 		}
@@ -607,7 +613,7 @@ func (o *object) maybeRecordRead(ignoreWritten bool) error {
 		if valueRef == nil || valueRef.version == nil {
 			return fmt.Errorf("Loading var %v failed to find value / update cache", o.id)
 		}
-		// log.Println(o.state.txn, "load", o.id, "->", valueRef.version, modifiedVars)
+		// fmt.Printf("%p: %p, load %v -> %v (modifiedVars: %v)\n", state.txn.cache, state.txn, o.id, valueRef.version, modifiedVars)
 		state.txn.stats.Loads[*o.id] = elapsed
 	}
 	state.read = true
