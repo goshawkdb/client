@@ -92,7 +92,16 @@ func (conn *conn) Start() error {
 
 	if err == nil {
 		return nil
-	} else if conn.protocol != nil {
+	} else {
+		conn.Shutdown()
+	}
+	conn.logger.Log("error", err)
+
+	return err
+}
+
+func (conn *conn) Shutdown() {
+	if conn.protocol != nil {
 		conn.protocol.InternalShutdown()
 	} else {
 		conn.handshaker.InternalShutdown()
@@ -100,9 +109,6 @@ func (conn *conn) Start() error {
 
 	conn.protocol = nil
 	conn.handshaker = nil
-	conn.logger.Log("error", err)
-
-	return err
 }
 
 // Dial
@@ -164,6 +170,18 @@ func (cr *connRun) init(conn *conn) {
 
 func (cr *connRun) start() error {
 	return cr.protocol.Run()
+}
+
+func (cr *connRun) SendMessage(msg []byte) error {
+	if cr.currentState == cr && cr.protocol != nil {
+		return cr.protocol.SendMessage(msg)
+	} else {
+		return errors.New("Connection not in correct state")
+	}
+}
+
+func (cr *connRun) IsRunning() bool {
+	return cr.currentState == cr && cr.protocol != nil
 }
 
 // handshaker
