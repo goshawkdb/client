@@ -25,7 +25,13 @@ type conn struct {
 	connRun
 }
 
-func newConnTCPTLSCapnpDialer(actor common.ConnectionActor, logger log.Logger, remoteHost string, clientCertAndKeyPEM, clusterCertPEM []byte) (*conn, error) {
+type connActor interface {
+	common.ConnectionActor
+	handleTxnOutcome(msgs.ClientTxnOutcome) error
+	handleSetup(roots map[string]*refCap, namespace []byte) error
+}
+
+func newConnTCPTLSCapnpDialer(actor connActor, logger log.Logger, remoteHost string, clientCertAndKeyPEM, clusterCertPEM []byte) (*conn, error) {
 	if _, _, err := net.SplitHostPort(remoteHost); err != nil {
 		remoteHost = fmt.Sprintf("%v:%v", remoteHost, common.DefaultPort)
 		_, _, err = net.SplitHostPort(remoteHost)
@@ -53,8 +59,6 @@ func newConnTCPTLSCapnpDialer(actor common.ConnectionActor, logger log.Logger, r
 	conn.connHandshake.init(conn)
 	conn.connRun.init(conn)
 
-	conn.currentState = &conn.connDial
-
 	return conn, nil
 }
 
@@ -66,7 +70,7 @@ type connStateMachineComponent interface {
 	connStateMachineComponentWitness()
 }
 
-func (conn *conn) nextState() {
+func (conn *conn) nextState() error {
 	switch conn.currentState {
 	case &conn.connDial:
 		conn.currentState = &conn.connHandshake
@@ -75,6 +79,30 @@ func (conn *conn) nextState() {
 	default:
 		panic(fmt.Sprintf("Unexpected current state for nextState: %v", conn.currentState))
 	}
+	return conn.currentState.start()
+}
+
+func (conn *conn) Start() error {
+	if conn.currentState != nil {
+		return errors.New("conn cannot be restarted.")
+	}
+
+	conn.currentState = &conn.connDial
+	err := conn.currentState.start()
+
+	if err == nil {
+		return nil
+	} else if conn.protocol != nil {
+		conn.protocol.InternalShutdown()
+	} else {
+		conn.handshaker.InternalShutdown()
+	}
+
+	conn.protocol = nil
+	conn.handshaker = nil
+	conn.logger.Log("error", err)
+
+	return err
 }
 
 // Dial
@@ -93,7 +121,7 @@ func (cd *connDial) init(conn *conn) {
 func (cd *connDial) start() error {
 	err := cd.handshaker.Dial()
 	if err == nil {
-		cd.nextState()
+		return cd.nextState()
 	}
 	return err
 }
@@ -115,7 +143,7 @@ func (ch *connHandshake) start() error {
 	protocol, err := ch.handshaker.PerformHandshake()
 	if err == nil {
 		ch.protocol = protocol
-		ch.nextState()
+		return ch.nextState()
 	}
 	return err
 }
@@ -140,7 +168,7 @@ func (cr *connRun) start() error {
 
 // handshaker
 
-func newTLSCapnpHandshaker(dialer *common.TCPDialer, logger log.Logger, actor common.ConnectionActor, cert *x509.Certificate, privKey *ecdsa.PrivateKey, clusterCertPEM []byte) *tlsCapnpHandshaker {
+func newTLSCapnpHandshaker(dialer *common.TCPDialer, logger log.Logger, actor connActor, cert *x509.Certificate, privKey *ecdsa.PrivateKey, clusterCertPEM []byte) *tlsCapnpHandshaker {
 	return &tlsCapnpHandshaker{
 		TLSCapnpHandshakerBase: common.NewTLSCapnpHandshakerBase(dialer),
 		logger:                 logger,
@@ -154,7 +182,7 @@ func newTLSCapnpHandshaker(dialer *common.TCPDialer, logger log.Logger, actor co
 type tlsCapnpHandshaker struct {
 	*common.TLSCapnpHandshakerBase
 	logger         log.Logger
-	actor          common.ConnectionActor
+	actor          connActor
 	clientCert     *x509.Certificate
 	clientPrivKey  *ecdsa.PrivateKey
 	clusterCertPEM []byte
@@ -271,7 +299,32 @@ func (tcc *tlsCapnpClient) finishHandshake() error {
 		}
 	}
 
-	return nil
+	if seg, err := tcc.ReadOne(); err == nil {
+		server := msgs.ReadRootHelloClientFromServer(seg)
+		rootsCap := server.Roots()
+		l := rootsCap.Len()
+		if l == 0 {
+			return errors.New("Cluster is not yet formed; Root objects have not been created.")
+		}
+		roots := make(map[string]*refCap, l)
+		for idx := 0; idx < l; idx++ {
+			rootCap := rootsCap.At(idx)
+			roots[rootCap.Name()] = &refCap{
+				vUUId:      common.MakeVarUUId(rootCap.VarId()),
+				capability: common.NewCapability(rootCap.Capability()),
+			}
+		}
+		namespace := make([]byte, common.KeyLen)
+		copy(namespace[8:], server.Namespace())
+		tcc.actor.EnqueueError(func() error {
+			return tcc.actor.handleSetup(roots, namespace)
+		})
+		return nil
+
+	} else {
+		return err
+	}
+
 }
 
 func (tcc *tlsCapnpClient) ReadAndHandleOneMsg() error {
@@ -289,9 +342,7 @@ func (tcc *tlsCapnpClient) ReadAndHandleOneMsg() error {
 		return nil // do nothing
 	case msgs.CLIENTMESSAGE_CLIENTTXNOUTCOME:
 		tcc.actor.EnqueueError(func() error {
-			// todo something with msg.ClientTxnOutcome()
-			panic("TODO")
-			return nil
+			return tcc.actor.handleTxnOutcome(msg.ClientTxnOutcome())
 		})
 		return nil
 	default:
