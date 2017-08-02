@@ -25,13 +25,7 @@ type conn struct {
 	connRun
 }
 
-type connActor interface {
-	common.ConnectionActor
-	handleTxnOutcome(msgs.ClientTxnOutcome) error
-	handleSetup(roots map[string]*refCap, namespace []byte) error
-}
-
-func newConnTCPTLSCapnpDialer(actor connActor, logger log.Logger, remoteHost string, clientCertAndKeyPEM, clusterCertPEM []byte) (*conn, error) {
+func newConnTCPTLSCapnpDialer(actor *Connection, logger log.Logger, remoteHost string, clientCertAndKeyPEM, clusterCertPEM []byte) (*conn, error) {
 	if _, _, err := net.SplitHostPort(remoteHost); err != nil {
 		remoteHost = fmt.Sprintf("%v:%v", remoteHost, common.DefaultPort)
 		_, _, err = net.SplitHostPort(remoteHost)
@@ -176,7 +170,7 @@ func (cr *connRun) SendMessage(msg []byte) error {
 	if cr.currentState == cr && cr.protocol != nil {
 		return cr.protocol.SendMessage(msg)
 	} else {
-		return errors.New("Connection not in correct state")
+		return errors.New("Connection not in correct state.")
 	}
 }
 
@@ -186,7 +180,7 @@ func (cr *connRun) IsRunning() bool {
 
 // handshaker
 
-func newTLSCapnpHandshaker(dialer *common.TCPDialer, logger log.Logger, actor connActor, cert *x509.Certificate, privKey *ecdsa.PrivateKey, clusterCertPEM []byte) *tlsCapnpHandshaker {
+func newTLSCapnpHandshaker(dialer *common.TCPDialer, logger log.Logger, actor *Connection, cert *x509.Certificate, privKey *ecdsa.PrivateKey, clusterCertPEM []byte) *tlsCapnpHandshaker {
 	return &tlsCapnpHandshaker{
 		TLSCapnpHandshakerBase: common.NewTLSCapnpHandshakerBase(dialer),
 		logger:                 logger,
@@ -200,7 +194,7 @@ func newTLSCapnpHandshaker(dialer *common.TCPDialer, logger log.Logger, actor co
 type tlsCapnpHandshaker struct {
 	*common.TLSCapnpHandshakerBase
 	logger         log.Logger
-	actor          connActor
+	actor          *Connection
 	clientCert     *x509.Certificate
 	clientPrivKey  *ecdsa.PrivateKey
 	clusterCertPEM []byte
@@ -369,8 +363,6 @@ func (tcc *tlsCapnpClient) ReadAndHandleOneMsg() error {
 }
 
 func (tcc *tlsCapnpClient) Run() error {
-	tcc.logger.Log("msg", "Connection established; awaiting roots.")
-
 	seg := capn.NewBuffer(nil)
 	message := msgs.NewRootClientMessage(seg)
 	message.SetHeartbeat()

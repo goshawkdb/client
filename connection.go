@@ -33,7 +33,7 @@ type Connection struct {
 	rng               *rand.Rand
 	conn              *conn
 	logger            log.Logger
-	established       chan struct{}
+	established       chan error
 }
 
 // Create a new connection. The hostPort parameter can be either
@@ -50,7 +50,7 @@ func NewConnection(hostPort string, clientCertAndKeyPEM, clusterCertPEM []byte, 
 		logger = log.With(logger, "ts", log.DefaultTimestampUTC)
 	}
 
-	established := make(chan struct{})
+	established := make(chan error)
 
 	c := &Connection{
 		nextVUUId:   0,
@@ -92,9 +92,12 @@ func NewConnection(hostPort string, clientCertAndKeyPEM, clusterCertPEM []byte, 
 
 	go c.actorLoop(head)
 
-	<-established
-
-	return c, nil
+	if err = <-established; err == nil {
+		logger.Log("msg", "Connection established.")
+		return c, nil
+	} else {
+		return nil, err
+	}
 }
 
 // Run a transaction. The transaction is the function supplied, and
@@ -295,6 +298,7 @@ func (c *Connection) handleShutdown(err error) {
 		c.liveTxn = nil
 	}
 	if c.established != nil {
+		c.established <- err
 		close(c.established)
 		c.established = nil
 	}
