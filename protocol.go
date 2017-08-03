@@ -25,7 +25,7 @@ type conn struct {
 	connRun
 }
 
-func newConnTCPTLSCapnpDialer(actor *Connection, logger log.Logger, remoteHost string, clientCertAndKeyPEM, clusterCertPEM []byte) (*conn, error) {
+func newConnTCPTLSCapnpDialer(actor *connectionInner, logger log.Logger, remoteHost string, clientCertAndKeyPEM, clusterCertPEM []byte) (*conn, error) {
 	if _, _, err := net.SplitHostPort(remoteHost); err != nil {
 		remoteHost = fmt.Sprintf("%v:%v", remoteHost, common.DefaultPort)
 		_, _, err = net.SplitHostPort(remoteHost)
@@ -180,7 +180,7 @@ func (cr *connRun) IsRunning() bool {
 
 // handshaker
 
-func newTLSCapnpHandshaker(dialer *common.TCPDialer, logger log.Logger, actor *Connection, cert *x509.Certificate, privKey *ecdsa.PrivateKey, clusterCertPEM []byte) *tlsCapnpHandshaker {
+func newTLSCapnpHandshaker(dialer *common.TCPDialer, logger log.Logger, actor *connectionInner, cert *x509.Certificate, privKey *ecdsa.PrivateKey, clusterCertPEM []byte) *tlsCapnpHandshaker {
 	return &tlsCapnpHandshaker{
 		TLSCapnpHandshakerBase: common.NewTLSCapnpHandshakerBase(dialer),
 		logger:                 logger,
@@ -194,7 +194,7 @@ func newTLSCapnpHandshaker(dialer *common.TCPDialer, logger log.Logger, actor *C
 type tlsCapnpHandshaker struct {
 	*common.TLSCapnpHandshakerBase
 	logger         log.Logger
-	actor          *Connection
+	actor          *connectionInner
 	clientCert     *x509.Certificate
 	clientPrivKey  *ecdsa.PrivateKey
 	clusterCertPEM []byte
