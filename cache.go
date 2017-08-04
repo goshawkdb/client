@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"goshawkdb.io/common"
 	msgs "goshawkdb.io/common/capnp"
-	"log"
 	"sync"
 )
 
@@ -100,7 +99,7 @@ func (c *cache) updateFromTxnAbort(updates *msgs.ClientUpdate_List) []*common.Va
 					modifiedVars = append(modifiedVars, vUUId)
 				}
 			default:
-				log.Fatal("Received update that was neither a read or write action:", action.Which())
+				panic(fmt.Sprint("Received update that was neither a read or write action:", action.Which()))
 			}
 		}
 	}
@@ -115,10 +114,10 @@ func (c *cache) updateFromDelete(vUUId *common.VarUUId, txnId *common.TxnId) {
 		vr.version = nil
 		vr.value = nil
 		vr.references = nil
-	} else if found {
-		log.Fatal("Divergence discovered on deletion of ", vUUId, ": server thinks we don't have ", txnId, " but we do!")
-	} else {
-		log.Fatal("Divergence discovered on deletion of ", vUUId, ": server thinks we had it cached, but we don't!")
+	} else if found && vr.version != nil { // so vr.version == txnId
+		panic(fmt.Sprint("Divergence discovered on deletion of ", vUUId, ": server thinks we don't have ", txnId, " but we do!"))
+	} else { // either not found, or found but vr.version == nil
+		panic(fmt.Sprint("Divergence discovered on deletion of ", vUUId, ": server thinks we had it cached, but we don't!"))
 	}
 }
 
@@ -127,8 +126,8 @@ func (c *cache) updateFromWrite(txnId *common.TxnId, vUUId *common.VarUUId, valu
 	updated := found && vr.version != nil
 	references := make([]refCap, refs.Len())
 	switch {
-	case found && vr.version.Compare(txnId) == common.EQ:
-		log.Fatal("Divergence discovered on update of ", vUUId, ": server thinks we don't have ", txnId, " but we do!")
+	case updated && vr.version.Compare(txnId) == common.EQ:
+		panic(fmt.Sprint("Divergence discovered on update of ", vUUId, ": server thinks we don't have ", txnId, " but we do!"))
 		return false
 	case found:
 	default:
@@ -144,17 +143,16 @@ func (c *cache) updateFromWrite(txnId *common.TxnId, vUUId *common.VarUUId, valu
 	vr.value = value
 	for idz, n := 0, refs.Len(); idz < n; idz++ {
 		ref := refs.At(idz)
-		if varId := ref.VarId(); len(varId) == common.KeyLen {
-			rc := &references[idz]
-			rc.vUUId = common.MakeVarUUId(varId)
-			rc.capability = common.NewCapability(ref.Capability())
-			vr, found := c.m[*rc.vUUId]
-			if found {
-				vr.capability = vr.capability.Union(rc.capability)
-			} else {
-				vr = &valueRef{capability: rc.capability}
-				c.m[*rc.vUUId] = vr
-			}
+		rc := &references[idz]
+		rc.vUUId = common.MakeVarUUId(ref.VarId())
+		rc.capability = common.NewCapability(ref.Capability())
+
+		vr, found := c.m[*rc.vUUId]
+		if found {
+			vr.capability = vr.capability.Union(rc.capability)
+		} else {
+			vr = &valueRef{capability: rc.capability}
+			c.m[*rc.vUUId] = vr
 		}
 	}
 	// fmt.Printf("%v@%v (%v)\n   (-> %v)\n", vUUId, txnId, value, references)
