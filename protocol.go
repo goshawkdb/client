@@ -328,7 +328,7 @@ func (tcc *tlsCapnpClient) finishHandshake() error {
 		}
 		namespace := make([]byte, common.KeyLen)
 		copy(namespace[8:], server.Namespace())
-		tcc.actor.EnqueueError(func() error {
+		tcc.actor.EnqueueFuncError(func() error {
 			return tcc.actor.handleSetup(roots, namespace)
 		})
 		return nil
@@ -353,7 +353,7 @@ func (tcc *tlsCapnpClient) ReadAndHandleOneMsg() error {
 	case msgs.CLIENTMESSAGE_HEARTBEAT:
 		return nil // do nothing
 	case msgs.CLIENTMESSAGE_CLIENTTXNOUTCOME:
-		tcc.actor.EnqueueError(func() error {
+		tcc.actor.EnqueueFuncError(func() error {
 			return tcc.actor.handleTxnOutcome(msg.ClientTxnOutcome())
 		})
 		return nil

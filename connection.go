@@ -156,15 +156,14 @@ func (c *Connection) nextVarUUId() *common.VarUUId {
 	return vUUId
 }
 
-type connectionMsg interface {
-	witness() connectionMsg
+type connectionMsg interface{}
+
+type connectionMsgSync interface {
+	connectionMsg
+	common.MsgSync
 }
 
-type connectionMsgBasic struct{}
-
-func (cmb connectionMsgBasic) witness() connectionMsg { return cmb }
-
-type connectionMsgShutdown struct{ connectionMsgBasic }
+type connectionMsgShutdown struct{}
 
 func (cms connectionMsgShutdown) Error() string {
 	return "Connection Shutdown"
@@ -178,52 +177,37 @@ func (c *Connection) Shutdown() {
 	}
 }
 
-type connectionMsgSyncQuery struct {
-	connectionMsgBasic
-	resultChan chan struct{}
-	err        error
-}
-
-func (cmsq *connectionMsgSyncQuery) init() {
-	cmsq.resultChan = make(chan struct{})
-}
-
 type connectionMsgTxn struct {
-	connectionMsgSyncQuery
+	common.MsgSyncQuery
+	err          error
 	txn          *msgs.ClientTxn
 	outcome      *msgs.ClientTxnOutcome
 	modifiedVars []*common.VarUUId
 }
 
-func (cmt *connectionMsgTxn) setOutcomeError(outcome *msgs.ClientTxnOutcome, modifiedVars []*common.VarUUId, err error) bool {
-	select {
-	case <-cmt.resultChan:
-		return false
-	default:
-		cmt.outcome = outcome
-		cmt.modifiedVars = modifiedVars
-		cmt.err = err
-		close(cmt.resultChan)
-		return true
+func (cmt *connectionMsgTxn) setOutcomeError(outcome *msgs.ClientTxnOutcome, modifiedVars []*common.VarUUId, err error) {
+	cmt.outcome = outcome
+	cmt.modifiedVars = modifiedVars
+	cmt.err = err
+	if !cmt.Close() {
+		panic("Cannot setOutcomeError as resultChan already closed!")
 	}
 }
 
 func (c *Connection) submitTransaction(txn *msgs.ClientTxn) (*msgs.ClientTxnOutcome, []*common.VarUUId, error) {
 	query := &connectionMsgTxn{txn: txn}
-	query.init()
-	if c.enqueueSyncQuery(query, query.resultChan) {
+	if c.enqueueQuerySync(query) {
 		return query.outcome, query.modifiedVars, query.err
 	} else {
 		return nil, nil, connectionMsgShutdown{}
 	}
 }
 
-type connectionMsgExecError func() error
+// for common/protocols.ConnectionActor
+type connectionMsgExecFuncError func() error
 
-func (cmee connectionMsgExecError) witness() connectionMsg { return cmee }
-
-func (c *connectionInner) EnqueueError(fun func() error) bool {
-	return c.enqueueQuery(connectionMsgExecError(fun))
+func (c *connectionInner) EnqueueFuncError(fun func() error) bool {
+	return c.enqueueQuery(connectionMsgExecFuncError(fun))
 }
 
 type connectionQueryCapture struct {
@@ -240,7 +224,8 @@ func (c *Connection) enqueueQuery(msg connectionMsg) bool {
 	return c.cellTail.WithCell(cqc.ccc)
 }
 
-func (c *Connection) enqueueSyncQuery(msg connectionMsg, resultChan chan struct{}) bool {
+func (c *Connection) enqueueQuerySync(msg connectionMsgSync) bool {
+	resultChan := msg.Init()
 	if c.enqueueQuery(msg) {
 		select {
 		case <-resultChan:
@@ -267,10 +252,10 @@ func (ci *connectionInner) actorLoop(head *cc.ChanCellHead) {
 	for !terminate {
 		if msg, ok := <-queryChan; ok {
 			terminate, err = ci.handleMsg(msg)
+			terminate = terminate || err != nil
 		} else {
 			head.Next(queryCell, chanFun)
 		}
-		terminate = terminate || err != nil
 	}
 	ci.cellTail.Terminate()
 	ci.handleShutdown(err)
@@ -280,12 +265,12 @@ func (ci *connectionInner) handleMsg(msg connectionMsg) (terminate bool, err err
 	switch msgT := msg.(type) {
 	case *connectionMsgTxn:
 		err = ci.submitTxn(msgT)
-	case connectionMsgExecError:
+	case connectionMsgExecFuncError:
 		err = msgT()
 	case connectionMsgShutdown:
 		terminate = true
 	default:
-		err = fmt.Errorf("Received unexpected message: %v", msgT)
+		panic(fmt.Sprintf("Received unexpected message: %#v", msgT))
 	}
 	return
 }
@@ -298,11 +283,8 @@ func (ci *connectionInner) handleShutdown(err error) {
 		ci.conn.Shutdown()
 		ci.conn = nil
 	}
-	e := fmt.Errorf("Connection shutting down")
 	if ci.liveTxn != nil {
-		if !ci.liveTxn.setOutcomeError(nil, nil, e) {
-			panic("Internal Logic Failure when closing outstanding live txn")
-		}
+		ci.liveTxn.setOutcomeError(nil, nil, connectionMsgShutdown{})
 		ci.liveTxn = nil
 	}
 	if ci.established != nil {
@@ -332,16 +314,12 @@ func (ci *connectionInner) handleSetup(roots map[string]*refCap, namespace []byt
 func (ci *connectionInner) submitTxn(txnMsg *connectionMsgTxn) error {
 	if ci.established != nil || ci.conn == nil || !ci.conn.IsRunning() {
 		err := errors.New("Connection not ready")
-		if !txnMsg.setOutcomeError(nil, nil, err) {
-			return err
-		}
+		txnMsg.setOutcomeError(nil, nil, err)
 		return nil
 	}
 	if ci.liveTxn != nil {
 		err := errors.New("Existing live txn")
-		if !txnMsg.setOutcomeError(nil, nil, err) {
-			return err
-		}
+		txnMsg.setOutcomeError(nil, nil, err)
 		return nil
 	}
 	binary.BigEndian.PutUint64(ci.namespace[:8], ci.nextTxnId)
@@ -361,16 +339,16 @@ func (ci *connectionInner) submitTxn(txnMsg *connectionMsgTxn) error {
 func (ci *connectionInner) handleTxnOutcome(outcome msgs.ClientTxnOutcome) error {
 	txnId := common.MakeTxnId(outcome.Id())
 	if ci.liveTxn == nil {
-		return fmt.Errorf("Received txn outcome for unknown txn: %v", txnId)
+		panic(fmt.Sprintf("Received txn outcome for unknown txn: %v", txnId))
 	}
 	finalTxnId := common.MakeTxnId(outcome.FinalId())
 	if !bytes.Equal(ci.liveTxn.txn.Id(), outcome.Id()) {
-		return fmt.Errorf("Received txn outcome for wrong txn: %v (expecting %v) (final %v) (which %v)", txnId, common.MakeTxnId(ci.liveTxn.txn.Id()), finalTxnId, outcome.Which())
+		panic(fmt.Sprintf("Received txn outcome for wrong txn: %v (expecting %v) (final %v) (which %v)", txnId, common.MakeTxnId(ci.liveTxn.txn.Id()), finalTxnId, outcome.Which()))
 	}
 	var err error
 	final := binary.BigEndian.Uint64(finalTxnId[:8])
 	if final < ci.nextTxnId {
-		return fmt.Errorf("Final (%v) < next (%v)\n", final, ci.nextTxnId)
+		panic(fmt.Sprintf("Final (%v) < next (%v)\n", final, ci.nextTxnId))
 	}
 	ci.nextTxnId = final + 1 + uint64(ci.rng.Intn(8))
 	var modifiedVars []*common.VarUUId
@@ -383,9 +361,7 @@ func (ci *connectionInner) handleTxnOutcome(outcome msgs.ClientTxnOutcome) error
 	case msgs.CLIENTTXNOUTCOME_ERROR:
 		err = errors.New(outcome.Error())
 	}
-	if !ci.liveTxn.setOutcomeError(&outcome, modifiedVars, err) {
-		return errors.New("Live txn already closed")
-	}
+	ci.liveTxn.setOutcomeError(&outcome, modifiedVars, err)
 	ci.liveTxn = nil
 	return nil
 }
