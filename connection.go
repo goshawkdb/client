@@ -62,6 +62,7 @@ func NewConnection(hostPort string, clientCertAndKeyPEM, clusterCertPEM []byte, 
 		logger = log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr))
 		logger = log.With(logger, "ts", log.DefaultTimestampUTC)
 	}
+	logger = log.With(logger, "remoteHost", hostPort)
 
 	established := make(chan error)
 
@@ -78,8 +79,6 @@ func NewConnection(hostPort string, clientCertAndKeyPEM, clusterCertPEM []byte, 
 	if err != nil {
 		panic(err) // "impossible"
 	}
-	c.mailbox = mailbox
-	c.basic = actor.NewBasicServerOuter(mailbox)
 
 	cp := &c.proto
 	cp.Connection = c
@@ -285,6 +284,18 @@ func (msg *connectionMsgTxnOutcome) Exec() (bool, error) {
 
 func (cp *connectionProtocol) TxnOutcome(outcome msgs.ClientTxnOutcome) {
 	cp.EnqueueMsg(&connectionMsgTxnOutcome{c: cp.Connection, outcome: outcome})
+}
+
+func (ci *connectionInner) Init(self *actor.Actor) (bool, error) {
+	terminate, err := ci.BasicServerInner.Init(self)
+	if terminate || err != nil {
+		return terminate, err
+	}
+
+	ci.mailbox = self.Mailbox
+	ci.basic = actor.NewBasicServerOuter(self.Mailbox)
+
+	return false, nil
 }
 
 func (ci *connectionInner) HandleShutdown(err error) bool {

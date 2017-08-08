@@ -97,7 +97,7 @@ func (conn *conn) Start() error {
 func (conn *conn) Shutdown() {
 	if conn.protocol != nil {
 		conn.protocol.InternalShutdown()
-	} else {
+	} else if conn.handshaker != nil {
 		conn.handshaker.InternalShutdown()
 	}
 
