@@ -7,8 +7,8 @@ import (
 	"fmt"
 	capn "github.com/glycerine/go-capnproto"
 	"github.com/go-kit/kit/log"
-	cc "github.com/msackman/chancell"
 	"goshawkdb.io/common"
+	"goshawkdb.io/common/actor"
 	msgs "goshawkdb.io/common/capnp"
 	"math/rand"
 	"os"
@@ -19,25 +19,34 @@ import (
 // Connection represents a connection to the GoshawkDB server. A
 // connection may only be used by one go-routine at a time.
 type Connection struct {
-	sync.RWMutex
-	curTxn            *Txn
-	nextVUUId         uint64
-	namespace         []byte
-	rootVUUIds        map[string]*refCap
-	cache             *cache
-	cellTail          *cc.ChanCellTail
-	enqueueQueryInner func(connectionMsg, *cc.ChanCell, cc.CurCellConsumer) (bool, cc.CurCellConsumer)
-	established       chan error
+	mailbox *actor.Mailbox          // enqueue msgs
+	basic   *actor.BasicServerOuter // ExecFuncAsync
+
+	lock        sync.RWMutex
+	curTxn      *Txn
+	nextVUUId   uint64
+	namespace   []byte
+	nextTxnId   uint64
+	rootVUUIds  map[string]*refCap
+	liveTxn     *connectionMsgTxn
+	conn        *conn
+	cache       *cache
+	rng         *rand.Rand
+	established chan error
+
+	inner connectionInner
+	proto connectionProtocol
 }
 
 type connectionInner struct {
+	*Connection             // need to access cache, namespace etc
+	*actor.BasicServerInner // super-type, essentially
+}
+
+type connectionProtocol struct {
 	*Connection
-	liveTxn   *connectionMsgTxn
-	nextTxnId uint64
-	queryChan <-chan connectionMsg
-	rng       *rand.Rand
-	conn      *conn
-	logger    log.Logger
+	*actor.Mailbox
+	*actor.BasicServerOuter // ExecFuncAsync
 }
 
 // Create a new connection. The hostPort parameter can be either
@@ -53,52 +62,38 @@ func NewConnection(hostPort string, clientCertAndKeyPEM, clusterCertPEM []byte, 
 		logger = log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr))
 		logger = log.With(logger, "ts", log.DefaultTimestampUTC)
 	}
+	logger = log.With(logger, "remoteHost", hostPort)
 
 	established := make(chan error)
 
 	c := &Connection{
-		nextVUUId:   0,
+		rng:         rand.New(rand.NewSource(time.Now().UnixNano())),
 		established: established,
 	}
 
-	ci := &connectionInner{
-		Connection: c,
-		nextTxnId:  0,
-		rng:        rand.New(rand.NewSource(time.Now().UnixNano())),
-		logger:     logger,
-	}
+	ci := &c.inner
+	ci.Connection = c
+	ci.BasicServerInner = actor.NewBasicServerInner(logger)
 
-	var head *cc.ChanCellHead
-	head, c.cellTail = cc.NewChanCellTail(
-		func(n int, cell *cc.ChanCell) {
-			queryChan := make(chan connectionMsg, n)
-			cell.Open = func() { ci.queryChan = queryChan }
-			cell.Close = func() { close(queryChan) }
-			c.enqueueQueryInner = func(msg connectionMsg, curCell *cc.ChanCell, cont cc.CurCellConsumer) (bool, cc.CurCellConsumer) {
-				if curCell == cell {
-					select {
-					case queryChan <- msg:
-						return true, nil
-					default:
-						return false, nil
-					}
-				} else {
-					return false, cont
-				}
-			}
-		})
-
-	conn, err := newConnTCPTLSCapnpDialer(ci, logger, hostPort, clientCertAndKeyPEM, clusterCertPEM)
+	mailbox, err := actor.Spawn(ci)
 	if err != nil {
-		return nil, err
-	}
-	ci.conn = conn
-
-	if err = ci.conn.Start(); err != nil {
-		return nil, err
+		panic(err) // "impossible"
 	}
 
-	go ci.actorLoop(head)
+	cp := &c.proto
+	cp.Connection = c
+	cp.Mailbox = mailbox
+	cp.BasicServerOuter = c.basic
+
+	cp.EnqueueFuncAsync(func() (bool, error) {
+		conn, err := newConnTCPTLSCapnpDialer(cp, ci.Logger, hostPort, clientCertAndKeyPEM, clusterCertPEM)
+		if err == nil {
+			c.conn = conn
+			return false, conn.Start()
+		} else {
+			return false, err
+		}
+	})
 
 	if err = <-established; err == nil {
 		logger.Log("msg", "Connection established.")
@@ -106,6 +101,16 @@ func NewConnection(hostPort string, clientCertAndKeyPEM, clusterCertPEM []byte, 
 	} else {
 		return nil, err
 	}
+}
+
+// Shutdown the connection, closing the socket and releasing all
+// resources. This method blocks until the socket is closed and
+// resources are released. Any transaction which is currently in the
+// process of being submitted to the server is killed off on the
+// client side: in this case, it is not possible to know whether or
+// not the server committed such a transaction or not.
+func (c *Connection) ShutdownSync() {
+	c.basic.ShutdownSync()
 }
 
 // Run a transaction. The transaction is the function supplied, and
@@ -130,238 +135,186 @@ func (c *Connection) RunTransaction(fun func(*Txn) (interface{}, error)) (interf
 		return nil, nil, fmt.Errorf("Unable to start transaction: root objects not ready")
 	}
 	var oldTxn *Txn
-	c.Lock()
+	c.lock.Lock()
 	txn := newTxn(fun, c, c.cache, roots, c.curTxn)
 	c.curTxn, oldTxn = txn, c.curTxn
-	c.Unlock()
+	c.lock.Unlock()
 	res, stats, err := txn.run()
-	c.Lock()
+	c.lock.Lock()
 	c.curTxn = oldTxn
-	c.Unlock()
+	c.lock.Unlock()
 	return res, stats, err
 }
 
 func (c *Connection) rootVarUUIds() map[string]*refCap {
-	c.RLock()
-	defer c.RUnlock()
+	c.lock.RLock()
+	defer c.lock.RUnlock()
 	return c.rootVUUIds
 }
 
 func (c *Connection) nextVarUUId() *common.VarUUId {
-	c.Lock()
-	defer c.Unlock()
+	c.lock.Lock()
+	defer c.lock.Unlock()
 	binary.BigEndian.PutUint64(c.namespace[:8], c.nextVUUId)
 	vUUId := common.MakeVarUUId(c.namespace)
 	c.nextVUUId++
 	return vUUId
 }
 
-type connectionMsg interface{}
-
-type connectionMsgSync interface {
-	connectionMsg
-	common.MsgSync
-}
-
-type connectionMsgShutdown struct{}
-
-func (cms connectionMsgShutdown) Error() string {
-	return "Connection Shutdown"
-}
-
-// Shutdown the connection. This will block until the connection is
-// closed.
-func (c *Connection) Shutdown() {
-	if c.enqueueQuery(connectionMsgShutdown{}) {
-		c.cellTail.Wait()
-	}
-}
-
 type connectionMsgTxn struct {
-	common.MsgSyncQuery
-	err          error
+	actor.MsgSyncQuery
+	c            *Connection
 	txn          *msgs.ClientTxn
 	outcome      *msgs.ClientTxnOutcome
 	modifiedVars []*common.VarUUId
+	err          error
 }
 
-func (cmt *connectionMsgTxn) setOutcomeError(outcome *msgs.ClientTxnOutcome, modifiedVars []*common.VarUUId, err error) {
-	cmt.outcome = outcome
-	cmt.modifiedVars = modifiedVars
-	cmt.err = err
-	if !cmt.Close() {
-		panic("Cannot setOutcomeError as resultChan already closed!")
+func (msg *connectionMsgTxn) setOutcomeError(outcome *msgs.ClientTxnOutcome, modifiedVars []*common.VarUUId, err error) {
+	msg.outcome = outcome
+	msg.modifiedVars = modifiedVars
+	msg.err = err
+	msg.MustClose()
+}
+
+func (msg *connectionMsgTxn) Exec() (bool, error) {
+	c := msg.c
+	if c.established != nil || c.conn == nil || !c.conn.IsRunning() {
+		msg.setOutcomeError(nil, nil, errors.New("Connection not ready"))
+		return false, nil
+	}
+	if c.liveTxn != nil {
+		msg.setOutcomeError(nil, nil, errors.New("Existing live txn"))
+		return false, nil
+	}
+	txn := msg.txn
+	c.lock.Lock()
+	binary.BigEndian.PutUint64(c.namespace[:8], c.nextTxnId)
+	txn.SetId(c.namespace)
+	c.lock.Unlock()
+	seg := capn.NewBuffer(nil)
+	txnCap := msgs.NewRootClientMessage(seg)
+	txnCap.SetClientTxnSubmission(*txn)
+	if err := c.conn.SendMessage(common.SegToBytes(seg)); err == nil {
+		c.liveTxn = msg
+		return false, nil
+	} else {
+		msg.setOutcomeError(nil, nil, err)
+		c.nextTxnId++
+		return false, err
 	}
 }
 
 func (c *Connection) submitTransaction(txn *msgs.ClientTxn) (*msgs.ClientTxnOutcome, []*common.VarUUId, error) {
-	query := &connectionMsgTxn{txn: txn}
-	if c.enqueueQuerySync(query) {
-		return query.outcome, query.modifiedVars, query.err
+	msg := &connectionMsgTxn{c: c, txn: txn}
+	msg.InitMsg(c.mailbox)
+	if c.mailbox.EnqueueMsg(msg) && msg.Wait() {
+		return msg.outcome, msg.modifiedVars, msg.err
 	} else {
-		return nil, nil, connectionMsgShutdown{}
+		return nil, nil, actor.MsgShutdown{}
 	}
 }
 
-// for common/protocols.ConnectionActor
-type connectionMsgExecFuncError func() error
-
-func (c *connectionInner) EnqueueFuncError(fun func() error) bool {
-	return c.enqueueQuery(connectionMsgExecFuncError(fun))
+type connectionMsgSetup struct {
+	c         *Connection
+	roots     map[string]*refCap
+	namespace []byte
 }
 
-type connectionQueryCapture struct {
-	c   *Connection
-	msg connectionMsg
-}
-
-func (cqc *connectionQueryCapture) ccc(cell *cc.ChanCell) (bool, cc.CurCellConsumer) {
-	return cqc.c.enqueueQueryInner(cqc.msg, cell, cqc.ccc)
-}
-
-func (c *Connection) enqueueQuery(msg connectionMsg) bool {
-	cqc := &connectionQueryCapture{c: c, msg: msg}
-	return c.cellTail.WithCell(cqc.ccc)
-}
-
-func (c *Connection) enqueueQuerySync(msg connectionMsgSync) bool {
-	resultChan := msg.Init()
-	if c.enqueueQuery(msg) {
-		select {
-		case <-resultChan:
-			return true
-		case <-c.cellTail.Terminated:
-			return false
-		}
-	} else {
-		return false
+func (msg *connectionMsgSetup) Exec() (bool, error) {
+	c := msg.c
+	if c.cache != nil {
+		panic("Setup called twice.")
 	}
+	c.lock.Lock()
+	c.rootVUUIds = msg.roots
+	c.namespace = msg.namespace
+	c.cache = newCache()
+	c.cache.SetRoots(msg.roots)
+	c.lock.Unlock()
+	if c.established != nil {
+		close(c.established)
+		c.established = nil
+	}
+	return false, nil
 }
 
-// actor loop
-
-func (ci *connectionInner) actorLoop(head *cc.ChanCellHead) {
-	var (
-		err       error
-		queryChan <-chan connectionMsg
-		queryCell *cc.ChanCell
-	)
-	chanFun := func(cell *cc.ChanCell) { queryChan, queryCell = ci.queryChan, cell }
-	head.WithCell(chanFun)
-	terminate := false
-	for !terminate {
-		if msg, ok := <-queryChan; ok {
-			terminate, err = ci.handleMsg(msg)
-			terminate = terminate || err != nil
-		} else {
-			head.Next(queryCell, chanFun)
-		}
-	}
-	ci.cellTail.Terminate()
-	ci.handleShutdown(err)
+func (cp *connectionProtocol) Setup(roots map[string]*refCap, namespace []byte) {
+	cp.EnqueueMsg(&connectionMsgSetup{c: cp.Connection, roots: roots, namespace: namespace})
 }
 
-func (ci *connectionInner) handleMsg(msg connectionMsg) (terminate bool, err error) {
-	switch msgT := msg.(type) {
-	case *connectionMsgTxn:
-		err = ci.submitTxn(msgT)
-	case connectionMsgExecFuncError:
-		err = msgT()
-	case connectionMsgShutdown:
-		terminate = true
-	default:
-		panic(fmt.Sprintf("Received unexpected message: %#v", msgT))
-	}
-	return
+type connectionMsgTxnOutcome struct {
+	c       *Connection
+	outcome msgs.ClientTxnOutcome
 }
 
-func (ci *connectionInner) handleShutdown(err error) {
-	if err != nil {
-		ci.logger.Log("error", err)
+func (msg *connectionMsgTxnOutcome) Exec() (bool, error) {
+	c := msg.c
+	outcome := msg.outcome
+	txnId := common.MakeTxnId(outcome.Id())
+	if c.liveTxn == nil {
+		panic(fmt.Sprintf("Received txn outcome for unknown txn: %v", txnId))
 	}
+
+	finalTxnId := common.MakeTxnId(outcome.FinalId())
+	if !bytes.Equal(c.liveTxn.txn.Id(), outcome.Id()) {
+		panic(fmt.Sprintf("Received txn outcome for wrong txn: %v (expecting %v) (final %v) (which %v)", txnId, common.MakeTxnId(c.liveTxn.txn.Id()), finalTxnId, outcome.Which()))
+	}
+	final := binary.BigEndian.Uint64(finalTxnId[:8])
+	if final < c.nextTxnId {
+		panic(fmt.Sprintf("Final (%v) < next (%v)\n", final, c.nextTxnId))
+	}
+	c.nextTxnId = final + 1 + uint64(c.rng.Intn(8))
+
+	var err error
+	var modifiedVars []*common.VarUUId
+	switch outcome.Which() {
+	case msgs.CLIENTTXNOUTCOME_COMMIT:
+		c.cache.updateFromTxnCommit(c.liveTxn.txn, finalTxnId)
+	case msgs.CLIENTTXNOUTCOME_ABORT:
+		updates := outcome.Abort()
+		modifiedVars = c.cache.updateFromTxnAbort(&updates)
+	case msgs.CLIENTTXNOUTCOME_ERROR:
+		err = errors.New(outcome.Error())
+	}
+	c.liveTxn.setOutcomeError(&outcome, modifiedVars, err)
+	c.liveTxn = nil
+	return false, nil
+}
+
+func (cp *connectionProtocol) TxnOutcome(outcome msgs.ClientTxnOutcome) {
+	cp.EnqueueMsg(&connectionMsgTxnOutcome{c: cp.Connection, outcome: outcome})
+}
+
+func (ci *connectionInner) Init(self *actor.Actor) (bool, error) {
+	terminate, err := ci.BasicServerInner.Init(self)
+	if terminate || err != nil {
+		return terminate, err
+	}
+
+	ci.mailbox = self.Mailbox
+	ci.basic = actor.NewBasicServerOuter(self.Mailbox)
+
+	return false, nil
+}
+
+func (ci *connectionInner) HandleShutdown(err error) bool {
 	if ci.conn != nil {
 		ci.conn.Shutdown()
 		ci.conn = nil
 	}
+	errShutdown := err
+	if err == nil {
+		errShutdown = actor.MsgShutdown{}
+	}
+	if ci.established != nil {
+		ci.established <- errShutdown
+		close(ci.established)
+		ci.established = nil
+	}
 	if ci.liveTxn != nil {
-		ci.liveTxn.setOutcomeError(nil, nil, connectionMsgShutdown{})
+		ci.liveTxn.setOutcomeError(nil, nil, errShutdown)
 		ci.liveTxn = nil
 	}
-	if ci.established != nil {
-		ci.established <- err
-		close(ci.established)
-		ci.established = nil
-	}
-}
-
-func (ci *connectionInner) handleSetup(roots map[string]*refCap, namespace []byte) error {
-	if ci.cache != nil {
-		panic("handleSetup called twice.")
-	}
-	ci.Lock()
-	ci.rootVUUIds = roots
-	ci.namespace = namespace
-	ci.Unlock()
-	ci.cache = newCache()
-	ci.cache.SetRoots(roots)
-	if ci.established != nil {
-		close(ci.established)
-		ci.established = nil
-	}
-	return nil
-}
-
-func (ci *connectionInner) submitTxn(txnMsg *connectionMsgTxn) error {
-	if ci.established != nil || ci.conn == nil || !ci.conn.IsRunning() {
-		err := errors.New("Connection not ready")
-		txnMsg.setOutcomeError(nil, nil, err)
-		return nil
-	}
-	if ci.liveTxn != nil {
-		err := errors.New("Existing live txn")
-		txnMsg.setOutcomeError(nil, nil, err)
-		return nil
-	}
-	binary.BigEndian.PutUint64(ci.namespace[:8], ci.nextTxnId)
-	txnMsg.txn.SetId(ci.namespace)
-	seg := capn.NewBuffer(nil)
-	msg := msgs.NewRootClientMessage(seg)
-	msg.SetClientTxnSubmission(*txnMsg.txn)
-	if err := ci.conn.SendMessage(common.SegToBytes(seg)); err == nil {
-		ci.liveTxn = txnMsg
-		return nil
-	} else {
-		ci.nextTxnId++
-		return err
-	}
-}
-
-func (ci *connectionInner) handleTxnOutcome(outcome msgs.ClientTxnOutcome) error {
-	txnId := common.MakeTxnId(outcome.Id())
-	if ci.liveTxn == nil {
-		panic(fmt.Sprintf("Received txn outcome for unknown txn: %v", txnId))
-	}
-	finalTxnId := common.MakeTxnId(outcome.FinalId())
-	if !bytes.Equal(ci.liveTxn.txn.Id(), outcome.Id()) {
-		panic(fmt.Sprintf("Received txn outcome for wrong txn: %v (expecting %v) (final %v) (which %v)", txnId, common.MakeTxnId(ci.liveTxn.txn.Id()), finalTxnId, outcome.Which()))
-	}
-	var err error
-	final := binary.BigEndian.Uint64(finalTxnId[:8])
-	if final < ci.nextTxnId {
-		panic(fmt.Sprintf("Final (%v) < next (%v)\n", final, ci.nextTxnId))
-	}
-	ci.nextTxnId = final + 1 + uint64(ci.rng.Intn(8))
-	var modifiedVars []*common.VarUUId
-	switch outcome.Which() {
-	case msgs.CLIENTTXNOUTCOME_COMMIT:
-		ci.cache.updateFromTxnCommit(ci.liveTxn.txn, finalTxnId)
-	case msgs.CLIENTTXNOUTCOME_ABORT:
-		updates := outcome.Abort()
-		modifiedVars = ci.cache.updateFromTxnAbort(&updates)
-	case msgs.CLIENTTXNOUTCOME_ERROR:
-		err = errors.New(outcome.Error())
-	}
-	ci.liveTxn.setOutcomeError(&outcome, modifiedVars, err)
-	ci.liveTxn = nil
-	return nil
+	return ci.BasicServerInner.HandleShutdown(err)
 }
