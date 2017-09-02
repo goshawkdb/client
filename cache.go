@@ -7,20 +7,37 @@ import (
 	"sync"
 )
 
+// Value with references. Holds the union of all capabilites received
+// for the value.
 type valueRef struct {
 	version    *common.TxnId
 	capability *common.Capability
 	value      []byte
-	references []refCap
+	references []RefCap
 }
 
-type refCap struct {
+// reference to some other var. Also contains a capability.
+type RefCap struct {
 	vUUId      *common.VarUUId
 	capability *common.Capability
 }
 
-func (rc refCap) String() string {
+func (rc RefCap) String() string {
 	return fmt.Sprintf("%v(%v)", rc.vUUId, rc.capability)
+}
+
+func (rc RefCap) DenyRead() RefCap {
+	return RefCap{
+		vUUId:      rc.vUUId,
+		capability: rc.capability.DenyRead(),
+	}
+}
+
+func (rc RefCap) DenyWrite() RefCap {
+	return RefCap{
+		vUUId:      rc.vUUId,
+		capability: rc.capability.DenyWrite(),
+	}
 }
 
 type cache struct {
@@ -28,22 +45,18 @@ type cache struct {
 	m map[common.VarUUId]*valueRef
 }
 
-func newCache() *cache {
-	return &cache{
-		m: make(map[common.VarUUId]*valueRef),
+func newCache(roots map[string]*RefCap) *cache {
+	m := make(map[common.VarUUId]*valueRef)
+	for _, rc := range roots {
+		m[*rc.vUUId] = &valueRef{capability: rc.capability}
 	}
+	return &cache{m: m}
 }
 
 func (c *cache) Get(vUUId *common.VarUUId) *valueRef {
 	c.RLock()
 	defer c.RUnlock()
 	return c.m[*vUUId]
-}
-
-func (c *cache) SetRoots(roots map[string]*refCap) {
-	for _, rc := range roots {
-		c.m[*rc.vUUId] = &valueRef{capability: rc.capability}
-	}
 }
 
 func (c *cache) updateFromTxnCommit(txn *msgs.ClientTxn, txnId *common.TxnId) {
@@ -69,6 +82,8 @@ func (c *cache) updateFromTxnCommit(txn *msgs.ClientTxn, txnId *common.TxnId) {
 			c.updateFromWrite(txnId, vUUId, create.Value(), &refs, true)
 		case msgs.CLIENTACTION_READ:
 			// do nothing
+		default:
+			panic(fmt.Sprintf("Unexpected action! %v", action.Which()))
 		}
 	}
 }
@@ -111,6 +126,7 @@ func (c *cache) updateFromDelete(vUUId *common.VarUUId, txnId *common.TxnId) {
 	// fmt.Printf("%p: updateFromDelete for %v at %v\n", c, vUUId, txnId)
 	if vr, found := c.m[*vUUId]; found && vr.version != nil && vr.version.Compare(txnId) != common.EQ {
 		// fmt.Printf("%p: %v removed from cache (req ver: %v; found ver: %v)\n", c, vUUId, txnId, vr.version)
+		// nb. we do not wipe out the capabilities nor the vr itself!
 		vr.version = nil
 		vr.value = nil
 		vr.references = nil
@@ -123,19 +139,18 @@ func (c *cache) updateFromDelete(vUUId *common.VarUUId, txnId *common.TxnId) {
 
 func (c *cache) updateFromWrite(txnId *common.TxnId, vUUId *common.VarUUId, value []byte, refs *msgs.ClientVarIdPos_List, created bool) bool {
 	vr, found := c.m[*vUUId]
-	updated := found && vr.version != nil
-	references := make([]refCap, refs.Len())
+	updated := found && vr.references != nil
+	references := make([]RefCap, refs.Len())
 	switch {
 	case updated && vr.version.Compare(txnId) == common.EQ:
 		panic(fmt.Sprint("Divergence discovered on update of ", vUUId, ": server thinks we don't have ", txnId, " but we do!"))
-		return false
 	case found:
 	default:
 		vr = &valueRef{}
 		c.m[*vUUId] = vr
 	}
 	if created {
-		vr.capability = common.MaxCapability
+		vr.capability = common.ReadWriteCapability
 	}
 	// fmt.Printf("%p: %v updated (%v -> %v)\n", c, vUUId, vr.version, txnId)
 	vr.references = references

@@ -6,790 +6,374 @@ import (
 	capn "github.com/glycerine/go-capnproto"
 	"goshawkdb.io/common"
 	msgs "goshawkdb.io/common/capnp"
-	"time"
 )
 
-// A Txn object holds the state of the current transaction and is
-// supplied to your transaction functions. Through this object you can
-// interact with the GoshawkDB object store.
-type Txn struct {
-	fun             func(*Txn) (interface{}, error)
-	conn            *Connection
-	cache           *cache
-	parent          *Txn
-	roots           map[string]*refCap
-	objs            map[common.VarUUId]*object
-	resetInProgress bool
-	stats           *Stats
+type Transaction struct {
+	parent     *Transaction
+	connection *Connection
+	rootCache  *cache
+
+	roots map[string]*RefCap
+
+	effects       map[common.VarUUId]*effect
+	restartNeeded bool
+	aborted       bool
 }
 
-// A Stats object is created for each root transaction and shared with
-// any nested transactions. It records some details about how the
-// transaction progressed.
-type Stats struct {
-	// Any objects that were loaded from the RM as part of this transaction are recorded
-	Loads map[common.VarUUId]time.Duration
-	// Every time the local transaction payload is submitted to the RM
-	// for validation and possible commitment, the time it took to
-	// perform the submission is added here. Thus as a single
-	// transaction may be submitted multiple times, so there may be
-	// multiple elements in this list. Nested transactions never appear
-	// here as nested transactions are client-side only.
-	Submissions []time.Duration
-	// The id of the transaction.
-	TxnId *common.TxnId
-}
-
-type TxnFunResult uint8
-
-const (
-	// If you return Retry as the result (not error) of a transaction
-	// then a retry transaction is performed.
-	Retry TxnFunResult = iota
-	// If the transaction detects that it needs to be restarted as soon
-	// as possible then all methods on Object will return Restart as an
-	// error. You should detect this and return Restart as an error in
-	// the transaction function, allowing the transaction function to
-	// be restarted promptly.
-	Restart TxnFunResult = iota
-)
-
-func (tfr TxnFunResult) Error() string {
-	switch tfr {
-	case Retry:
-		return "Retry"
-	case Restart:
-		return "Restart"
-	default:
-		panic(fmt.Sprintf("Unexpected TxnFunResult value: %v", tfr))
+func runRootTxn(fun func(*Transaction) (interface{}, error), c *Connection, cache *cache, roots map[string]*RefCap) (interface{}, error) {
+	txn := &Transaction{
+		connection: c,
+		rootCache:  cache,
+		roots:      roots,
 	}
+	return txn.run(fun)
 }
 
-func newTxn(fun func(*Txn) (interface{}, error), conn *Connection, cache *cache, roots map[string]*refCap, parent *Txn) *Txn {
-	t := &Txn{
-		fun:    fun,
-		conn:   conn,
-		cache:  cache,
-		parent: parent,
-		roots:  roots,
-		objs:   make(map[common.VarUUId]*object),
+func (t *Transaction) Transact(fun func(*Transaction) (interface{}, error)) (interface{}, error) {
+	if err := t.valid(); err != nil {
+		return nil, err
 	}
-	if parent == nil {
-		t.stats = &Stats{
-			Loads:       make(map[common.VarUUId]time.Duration),
-			Submissions: []time.Duration{},
-		}
-		t.resetInProgress = false
-	} else {
-		t.stats = parent.stats
-		t.resetInProgress = parent.resetInProgress
+	c := &Transaction{
+		parent:     t,
+		connection: t.connection,
+		rootCache:  t.rootCache,
+		roots:      t.roots,
 	}
-	// fmt.Printf("%p: newTxn %p (parent %p)\n", cache, t, parent)
-	return t
+	return c.run(fun)
 }
 
-func (txn *Txn) run() (interface{}, *Stats, error) {
-	defer txn.resetObjects()
-
-	for {
-		if txn.resetInProgress {
-			if txn.parent == nil || !txn.parent.resetInProgress {
-				txn.resetInProgress = false
-			} else {
-				// fmt.Printf("%p refusing to start txn as resetInProgress\n", txn.cache, txn)
-				return nil, txn.stats, Restart
-			}
-		}
-		txn.resetObjects()
-		// fmt.Printf("%p, %p starting fun\n", txn.cache, txn)
-		result, err := txn.fun(txn)
-		// fmt.Printf("%p, %p finished fun\n", txn.cache, txn)
-
-		switch {
-		case err != nil && err != Restart:
-			// fmt.Printf("%p, %p 1 returning %v %v\n", txn.cache, txn, result, err)
-			return nil, txn.stats, err
-		case txn.resetInProgress:
-			if txn.parent == nil || !txn.parent.resetInProgress {
-				// fmt.Printf("%p, %p 2 resetInProgress, continuing\n", txn.cache, txn)
-				continue
-			} else {
-				// fmt.Printf("%p, %p 3 resetInProgress, returning %v\n", txn.cache, txn, result)
-				return nil, txn.stats, Restart
-			}
-		case result == Retry:
-			err = txn.submitRetryTransaction()
-			switch {
-			case err != nil:
-				// fmt.Printf("%p, %p 4 retry, returning err %v\n", txn.cache, txn, err)
-				return nil, txn.stats, err
-			case txn.parent == nil:
-				// fmt.Printf("%p, %p 5 retry, continuing\n", txn.cache, txn)
-				continue
-			default:
-				// fmt.Printf("%p, %p 6 retry, returning\n", txn.cache, txn)
-				return nil, txn.stats, Restart
-			}
-		case txn.parent == nil:
-			// fmt.Printf("%p, %p 7 submitting to server\n", txn.cache, txn)
-			start := time.Now()
-			rerun, err := txn.submitToServer()
-			txn.stats.Submissions = append(txn.stats.Submissions, time.Now().Sub(start))
-			switch {
-			case err != nil:
-				// fmt.Printf("%p, %p 8 returning err %v\n", txn.cache, txn, err)
-				return nil, txn.stats, err
-			case rerun:
-				// fmt.Printf("%p, %p 9 continuing rerun\n", txn.cache, txn)
-				continue
-			default:
-				// fmt.Printf("%p, %p 10 returning success %v\n", txn.cache, txn, result)
-				return result, txn.stats, nil
-			}
-		default:
-			// fmt.Printf("%p, %p 11 moving to parent\n", txn.cache, txn)
-			txn.moveObjsToParent()
-			// fmt.Printf("%p, %p 11 returning %v (parent is %p)\n", txn.cache, txn, result, txn.parent)
-			return result, txn.stats, nil
-		}
-	}
+func (t *Transaction) Root(name string) *RefCap {
+	return t.roots[name]
 }
 
-func (txn *Txn) resetObjects() {
-	for vUUId, obj := range txn.objs {
-		if obj.state.txn == txn {
-			// fmt.Printf("%p, %p resetting %v\n", txn.cache, txn, obj.id)
-			obj.state = obj.state.parentState
-		}
-		// fmt.Printf("%p, %p deleting %v\n", txn.cache, txn, obj.id)
-		delete(txn.objs, vUUId)
+func (t *Transaction) Abort() (err error) {
+	if err = t.valid(); err != nil {
+		return
 	}
+	t.aborted = true
+	return
 }
 
-func (txn *Txn) submitRetryTransaction() error {
-	reads := make(map[common.VarUUId]*objectState)
-	for ancestor := txn; ancestor != nil; ancestor = ancestor.parent {
-		for _, obj := range ancestor.objs {
-			if _, found := reads[*obj.id]; !found && obj.state.txn == ancestor && obj.state.read {
-				reads[*obj.id] = obj.state
+func (t *Transaction) RestartNeeded() bool {
+	return t.restartNeeded
+}
+
+func (t *Transaction) Retry() (err error) {
+	if err = t.valid(); err != nil {
+		return
+	}
+	reads := make(map[common.VarUUId]*valueRef)
+	for cur := t; cur != nil; cur = cur.parent {
+		for vUUId, e := range cur.effects {
+			if e.origRead {
+				reads[vUUId] = e.root
 			}
 		}
 	}
+	if len(reads) == 0 {
+		return noReads
+	}
+
 	seg := capn.NewBuffer(nil)
 	cTxn := msgs.NewClientTxn(seg)
 	cTxn.SetRetry(true)
 	actions := msgs.NewClientActionList(seg, len(reads))
 	cTxn.SetActions(actions)
 	idx := 0
-	for _, state := range reads {
+	for vUUId, vr := range reads {
 		action := actions.At(idx)
-		action.SetVarId(state.id[:])
+		action.SetVarId(vUUId[:])
 		action.SetRead()
-		action.Read().SetVersion(state.curVersion[:])
+		action.Read().SetVersion(vr.version[:])
 		idx++
 	}
-	outcome, _, err := txn.conn.submitTransaction(&cTxn)
+	outcome, modifiedVars, err := t.connection.submitTransaction(&cTxn)
 	if err != nil {
 		return err
 	}
-	txn.stats.TxnId = common.MakeTxnId(outcome.FinalId())
-	for ancestor := txn; ancestor != nil; ancestor = ancestor.parent {
-		ancestor.resetInProgress = true
+	if outcome.Which() != msgs.CLIENTTXNOUTCOME_ABORT {
+		panic("When retrying, failed to get abort outcome!")
 	}
-	return nil
+	t.determineRestart(modifiedVars)
+
+	return
 }
 
-func (txn *Txn) moveObjsToParent() {
-	parent := txn.parent
-	// fmt.Printf("%p: %p moveObjsToParent %p\n", txn.cache, txn, parent)
-	objs := parent.objs
-	for _, obj := range txn.objs {
-		state := obj.state
-		state.txn = parent
-		if state.parentState != nil && state.parentState.txn == parent {
-			state.parentState = state.parentState.parentState
-		}
-		// fmt.Printf("%p: %p Set %v state[%p] to %v\n", txn.cache, txn, obj.id, parent, state)
-		if _, found := objs[*obj.id]; !found {
-			// fmt.Printf("%p: %p added to parent %p objs %v\n", txn.cache, txn, parent, obj.id)
-			objs[*obj.id] = obj
-		}
-	}
-}
+var (
+	noReadCap     = errors.New("No capability to read.")
+	noWriteCap    = errors.New("No capability to write.")
+	aborted       = errors.New("Transaction has been aborted.")
+	restartNeeded = errors.New("Restart needed.")
+	noReads       = errors.New("Cannot retry: transaction never made any reads.")
+)
 
-func (txn *Txn) varsUpdated(vUUIds []*common.VarUUId) bool {
-	// fmt.Printf("%p: in txn %p varsUpdated; parent= %p\n", txn.cache, txn, txn.parent)
-	switch {
-	case txn.parent != nil && txn.parent.varsUpdated(vUUIds):
-		txn.resetInProgress = true
-		return true
-	case txn.resetInProgress:
-		return true
-	default:
-		for _, vUUId := range vUUIds {
-			if obj, found := txn.objs[*vUUId]; found {
-				// fmt.Printf("%p: found %v, r,w,c: %v %v %v, %p vs %p\n", txn.cache, vUUId, obj.state.read, obj.state.write, obj.state.create, obj.state.txn, txn)
-				if obj.state.read && obj.state.txn == txn {
-					txn.resetInProgress = true
-					return true
-				}
-			}
-		}
-		return false
+func (t *Transaction) valid() error {
+	if t.aborted {
+		return aborted
+	} else if t.restartNeeded {
+		return restartNeeded
+	} else {
+		return nil
 	}
 }
 
-func (txn *Txn) submitToServer() (bool, error) {
-	// fmt.Printf("%p: %p Submitting to conn\n", txn.cache, txn)
-	reads := make([]*objectState, 0, len(txn.objs))
-	writes := make([]*objectState, 0, len(txn.objs))
-	readwrites := make([]*objectState, 0, len(txn.objs))
-	creates := make([]*objectState, 0, len(txn.objs))
-	for _, obj := range txn.objs {
-		state := obj.state
+func (t *Transaction) Read(ref RefCap) (value []byte, refs []RefCap, err error) {
+	if err = t.valid(); err != nil {
+		return
+	}
+	e := t.find(ref.vUUId, true)
+	if e.root != nil && !e.root.capability.CanRead() {
+		return nil, nil, noReadCap
+	}
+	if e.curRefs == nil { // we need to load it
+		vr, modifiedVars, err := t.load(ref.vUUId)
+		if err != nil {
+			return nil, nil, err
+		}
+		e.curValue = vr.value
+		e.curRefs = vr.references
+		t.determineRestart(modifiedVars)
+		if t.restartNeeded {
+			return nil, nil, restartNeeded
+		}
+	}
+
+	// we read the original if we haven't written it yet, and we didn't create it
+	e.origRead = e.origRead || (!e.origWritten && e.root != nil)
+
+	value = make([]byte, len(e.curValue))
+	copy(value, e.curValue)
+	refs = make([]RefCap, len(e.curRefs))
+	copy(refs, e.curRefs)
+	return
+}
+
+func (t *Transaction) Write(ref RefCap, value []byte, refs ...RefCap) (err error) {
+	if err = t.valid(); err != nil {
+		return
+	}
+	e := t.find(ref.vUUId, true)
+	if e.root != nil && !e.root.capability.CanWrite() {
+		return noWriteCap
+	}
+
+	// we wrote to the original if we haven't created it
+	e.origWritten = e.origWritten || e.root != nil
+
+	curValue := make([]byte, len(value))
+	copy(curValue, value)
+	curRefs := make([]RefCap, len(refs))
+	copy(curRefs, refs)
+
+	e.curValue = curValue
+	e.curRefs = curRefs
+	return
+}
+
+func (t *Transaction) Create(value []byte, refs ...RefCap) (ref RefCap, err error) {
+	if err = t.valid(); err != nil {
+		return
+	}
+	vUUId := t.connection.nextVarUUId()
+	ref.vUUId = vUUId
+	ref.capability = common.ReadWriteCapability
+
+	curValue := make([]byte, len(value))
+	copy(curValue, value)
+	curRefs := make([]RefCap, len(refs))
+	copy(curRefs, refs)
+
+	e := &effect{
+		curValue: curValue,
+		curRefs:  curRefs,
+	}
+	t.effects[*vUUId] = e
+	return
+}
+
+type effect struct {
+	root        *valueRef // nb root will be nil if txn has created this fresh.
+	curValue    []byte
+	curRefs     []RefCap
+	origRead    bool
+	origWritten bool
+}
+
+func (e *effect) clone() *effect {
+	c := *e
+	return &c
+}
+
+func (e *effect) setRefs(seg *capn.Segment, setter func(msgs.ClientVarIdPos_List)) {
+	refs := msgs.NewClientVarIdPosList(seg, len(e.curRefs))
+	for idx, rc := range e.curRefs {
+		ref := refs.At(idx)
+		ref.SetVarId(rc.vUUId[:])
+		ref.SetCapability(rc.capability.Capability)
+	}
+	setter(refs)
+}
+
+func (t *Transaction) find(vUUId *common.VarUUId, clone bool) *effect {
+	if e, found := t.effects[*vUUId]; found {
+		return e
+	} else if t.parent != nil {
+		e := t.parent.find(vUUId, false)
+		if clone {
+			e = e.clone()
+			t.effects[*vUUId] = e
+			return e
+		} else {
+			return e
+		}
+	} else if vr := t.rootCache.Get(vUUId); vr == nil {
+		panic(fmt.Sprintf("Attempt to fetch unknown object: %v", vUUId))
+	} else {
+		e := &effect{
+			root:     vr,
+			curValue: vr.value,
+			curRefs:  vr.references,
+		}
+		if clone {
+			t.effects[*vUUId] = e
+		}
+		return e
+	}
+}
+
+func (t *Transaction) run(fun func(*Transaction) (interface{}, error)) (result interface{}, err error) {
+	defer t.empty()
+
+	for {
+		t.restartNeeded = false
+		t.effects = make(map[common.VarUUId]*effect)
+		result, err = fun(t)
+
 		switch {
-		case state.create:
-			creates = append(creates, state)
-		case state.read && state.write:
-			readwrites = append(readwrites, state)
-		case state.write:
-			writes = append(writes, state)
-		case state.read:
-			reads = append(reads, state)
+		case err != nil || t.aborted:
+			return
+		case t.restartNeeded && (t.parent == nil || !t.parent.restartNeeded):
+			continue
+		case t.restartNeeded:
+			return
+		case t.parent == nil:
+			err = t.commitToServer()
+			return
+		default:
+			t.commitToParent()
+			return
 		}
 	}
+}
 
-	totalLen := len(reads) + len(writes) + len(readwrites) + len(creates)
-	if totalLen == 0 {
-		return false, nil
+func (t *Transaction) commitToParent() {
+	p := t.parent
+	for vUUId, e := range t.effects {
+		if pe, found := p.effects[vUUId]; found {
+			// invariant: pe.root == e.root
+			pe.curValue = e.curValue
+			pe.curRefs = e.curRefs
+			pe.origRead = pe.origRead || e.origRead
+			pe.origWritten = pe.origWritten || e.origWritten
+		} else {
+			p.effects[vUUId] = e
+		}
 	}
+}
 
-	// fmt.Printf("%p: %p r:%v; w:%v; rw:%v; c%v;\n", txn.cache, txn, len(reads), len(writes), len(readwrites), len(creates))
-
-	total := make([]*objectState, totalLen)
-	copy(total, reads)
-	writeThresh := len(reads)
-	copy(total[writeThresh:], writes)
-	readwriteThresh := writeThresh + len(writes)
-	copy(total[readwriteThresh:], readwrites)
-	createThresh := readwriteThresh + len(readwrites)
-	copy(total[createThresh:], creates)
+func (t *Transaction) commitToServer() (err error) {
+	// invariant: t.parent == nil
+	if len(t.effects) == 0 {
+		return nil
+	}
 
 	seg := capn.NewBuffer(nil)
 	cTxn := msgs.NewClientTxn(seg)
 	cTxn.SetRetry(false)
-	actions := msgs.NewClientActionList(seg, totalLen)
+	actions := msgs.NewClientActionList(seg, len(t.effects))
 	cTxn.SetActions(actions)
 	idx := 0
-	for _, state := range total {
+	t.connection.inner.Logger.Log("msg", "starting submission.")
+
+	for vUUId, e := range t.effects {
 		action := actions.At(idx)
-		action.SetVarId(state.id[:])
-		if idx < writeThresh {
-			action.SetRead()
-			action.Read().SetVersion(state.curVersion[:])
-		} else {
-			refs := msgs.NewClientVarIdPosList(seg, len(state.curObjectRefs))
-			for idy, objRef := range state.curObjectRefs {
-				ref := refs.At(idy)
-				ref.SetVarId(objRef.id[:])
-				ref.SetCapability(objRef.capability.Capability)
-			}
-			switch {
-			case idx < readwriteThresh:
-				action.SetWrite()
-				write := action.Write()
-				write.SetValue(state.curValue)
-				write.SetReferences(refs)
-			case idx < createThresh:
-				action.SetReadwrite()
-				rw := action.Readwrite()
-				rw.SetVersion(state.curVersion[:])
-				rw.SetValue(state.curValue)
-				rw.SetReferences(refs)
-			default:
-				action.SetCreate()
-				create := action.Create()
-				create.SetValue(state.curValue)
-				create.SetReferences(refs)
-			}
-		}
 		idx++
+		action.SetVarId(vUUId[:])
+		switch {
+		case e.root == nil:
+			t.connection.inner.Logger.Log("action", "created", "vUUId", vUUId)
+			action.SetCreate()
+			create := action.Create()
+			create.SetValue(e.curValue)
+			e.setRefs(seg, create.SetReferences)
+		case e.origRead && e.origWritten:
+			t.connection.inner.Logger.Log("action", "rw", "vUUId", vUUId)
+			action.SetReadwrite()
+			rw := action.Readwrite()
+			rw.SetVersion(e.root.version[:])
+			rw.SetValue(e.curValue)
+			e.setRefs(seg, rw.SetReferences)
+		case e.origRead:
+			t.connection.inner.Logger.Log("action", "read", "vUUId", vUUId)
+			action.SetRead()
+			action.Read().SetVersion(e.root.version[:])
+		case e.origWritten:
+			t.connection.inner.Logger.Log("action", "wrote", "vUUId", vUUId)
+			action.SetWrite()
+			write := action.Write()
+			write.SetValue(e.curValue)
+			e.setRefs(seg, write.SetReferences)
+		default:
+			panic(fmt.Sprintf("Effect appears to be a noop! %#v", e))
+		}
 	}
-	outcome, _, err := txn.conn.submitTransaction(&cTxn)
+	t.connection.inner.Logger.Log("msg", "submitting")
+
+	_, modifiedVars, err := t.connection.submitTransaction(&cTxn)
 	if err != nil {
-		// panic(err) // useful for debug
-		return false, err
-	}
-	txn.stats.TxnId = common.MakeTxnId(outcome.FinalId())
-	return outcome.Which() == msgs.CLIENTTXNOUTCOME_ABORT, nil
-}
-
-// Returns the database Root Objects. The Root Objects for each client
-// are defined by the cluster configuration represent the roots of the
-// object graphs. For an object to be reachable, there must be a
-// readable path to it from a Root Object. If an error is returned,
-// the current transaction should immediately be restarted (return the
-// error Restart)
-func (txn *Txn) GetRootObjects() (map[string]ObjectRef, error) {
-	roots := make(map[string]ObjectRef, len(txn.roots))
-	for name, rc := range txn.roots {
-		if obj, err := txn.getObject(rc.vUUId, true); err == nil {
-			objRef := ObjectRef{
-				object:     obj,
-				capability: rc.capability,
-			}
-			roots[name] = objRef
-		} else {
-			return nil, err
-		}
-	}
-	return roots, nil
-}
-
-// Create a new object and set its value and references. This method
-// takes copies of both the value and the references so if you modify
-// either after calling this method, your modifications will not take
-// effect. If the error is Restart, you should return Restart as an
-// error in the transaction. The ObjectRef returned will contain the
-// ReadWrite capability and the client is granted the full ReadWrite
-// capability on the object for the lifetime of the client connection.
-func (txn *Txn) CreateObject(value []byte, references ...ObjectRef) (ObjectRef, error) {
-	if txn.resetInProgress {
-		return ObjectRef{}, Restart
-	}
-
-	obj := &object{
-		id:   txn.conn.nextVarUUId(),
-		conn: txn.conn,
-	}
-	obj.ObjectRef = ObjectRef{object: obj}.GrantCapability(ReadWrite)
-	txn.objs[*obj.id] = obj
-
-	state := &objectState{
-		object:        obj,
-		parentState:   nil,
-		txn:           txn,
-		curValue:      make([]byte, len(value)),
-		curObjectRefs: make([]ObjectRef, len(references)),
-		create:        true,
-	}
-	copy(state.curValue, value)
-	copy(state.curObjectRefs, references)
-	obj.state = state
-
-	return obj.ObjectRef, nil
-}
-
-// Fetches the ObjectRef specified by this ObjectRef. Note this will
-// fail unless the client has already navigated the object graph at
-// least as far as any object that has a reference to the object
-// id. This method is not normally necessary: it is generally
-// preferred to use the References of objects to navigate. This method
-// is useful if you are storing ObjectRefs outside the database object
-// graph and can guarantee the connection you're using will have
-// already reached the object in question.
-func (txn *Txn) GetObject(objRef ObjectRef) (ObjectRef, error) {
-	if txn.resetInProgress {
-		return ObjectRef{}, Restart
-	}
-	if objRef.object == nil {
-		return ObjectRef{}, errors.New("Attempt to dereference nil ObjectRef!")
-	}
-	obj, err := txn.getObject(objRef.id, true)
-	if err == nil {
-		objRef.object = obj
-		return objRef, nil
-	} else {
-		return ObjectRef{}, err
-	}
-}
-
-func (txn *Txn) getObject(vUUId *common.VarUUId, addToTxn bool) (*object, error) {
-	if obj, found := txn.objs[*vUUId]; found {
-		return obj, nil
-	}
-
-	if txn.parent != nil {
-		if obj, err := txn.parent.getObject(vUUId, false); err != nil {
-			return nil, err
-		} else if obj != nil {
-			if addToTxn {
-				obj.state = obj.state.clone(txn)
-				txn.objs[*obj.id] = obj
-			}
-			return obj, nil
-		}
-	}
-
-	if addToTxn {
-		vr := txn.cache.Get(vUUId)
-		if vr == nil {
-			return nil, fmt.Errorf("Attempt to dereference ObjectRef to unknown object: %v\n", vUUId)
-		}
-		// Can't reuse objRef.object because it could be from a different
-		// connection. Obviously this could be abused to extend
-		// capabilities, but the server enforces them ultimately.
-		obj := &object{
-			id:   vUUId,
-			conn: txn.conn,
-		}
-		obj.ObjectRef = ObjectRef{
-			object:     obj,
-			capability: vr.capability,
-		}
-		txn.objs[*vUUId] = obj
-		obj.state = &objectState{object: obj, txn: txn}
-		return obj, nil
-	}
-
-	return nil, nil
-}
-
-func (txn *Txn) String() string {
-	return fmt.Sprintf("txn_%p(%p)", txn, txn.parent)
-}
-
-type object struct {
-	ObjectRef
-	id    *common.VarUUId
-	conn  *Connection
-	state *objectState
-}
-
-type Capability uint8
-
-const (
-	// An ObjectRef with the None capability grants you no actions on
-	// the object.
-	None Capability = iota
-	// An ObjectRef with the Read capability grants you the ability to
-	// read the object value, its version and its references.
-	Read Capability = iota
-	// An ObjectRef with the Write capability grants you the ability to
-	// set (write) the object value and references.
-	Write Capability = iota
-	// An ObjectRef with the ReadWrite capability grants you both the
-	// Read and Write capabilities.
-	ReadWrite Capability = iota
-)
-
-// ObjectRef represents a reference (or pointer) to an object in the
-// database, combined with a capability to act on that
-// object. ObjectRefs are linked to Connections: if you're using
-// multiple Connections, it is not permitted to use the same ObjectRef
-// in both connections; you can either navigate to the same object in
-// both connections or once that is done in each connection, you can
-// use GetObject to get a new ObjectRef to the same object in the
-// other connection. Within the same Connection, and within nested
-// transactions, ObjectRefs may be freely reused.
-type ObjectRef struct {
-	*object
-	capability *common.Capability
-}
-
-// Use this method to test if two ObjectRefs are references to the
-// same object in the database. This method does not test for equality
-// of capability within the ObjectRefs.
-func (a ObjectRef) ReferencesSameAs(b ObjectRef) bool {
-	return a.object != nil && b.object != nil &&
-		(a.object == b.object || a.object.id.Compare(b.object.id) == common.EQ)
-}
-
-func (objRef ObjectRef) String() string {
-	return fmt.Sprintf("Reference to %v with %v", objRef.id, objRef.capability)
-}
-
-// Reveal which capabilities this ObjectRef contains.
-func (objRef ObjectRef) RefCapability() Capability {
-	if objRef.capability == nil {
-		panic("Nil capability within objRef")
-	}
-	switch objRef.capability.Which() {
-	case msgs.CAPABILITY_NONE:
-		return None
-	case msgs.CAPABILITY_READ:
-		return Read
-	case msgs.CAPABILITY_WRITE:
-		return Write
-	default:
-		return ReadWrite
-	}
-}
-
-// Reveal which capabilities have been discovered by this client on
-// the object to which this ObjectRef refers. This is the union of the
-// capabilities from all of the ObjectRefs that refer to this same
-// object as encountered, to date, by this connection.
-func (objRef ObjectRef) ObjectCapability() Capability {
-	if objRef.object == nil {
-		return None
-	} else {
-		return objRef.object.ObjectRef.RefCapability()
-	}
-}
-
-// Create a new ObjectRef to the same database object but with
-// different capabilities. This will always succeed, but the
-// transaction may be rejected if you attempt to grant capabilities
-// you have not received. From a ReadWrite capability, you can grant
-// anything. From a Read capability you can grant only a Read or
-// None. From a Write capability you can grant only a Write or
-// None. From a None capability you can only grant a None.
-func (objRef ObjectRef) GrantCapability(capability Capability) ObjectRef {
-	seg := capn.NewBuffer(nil)
-	cap := msgs.NewCapability(seg)
-	switch capability {
-	case None:
-		cap.SetNone()
-	case Read:
-		cap.SetRead()
-	case Write:
-		cap.SetWrite()
-	case ReadWrite:
-		cap.SetReadWrite()
-	default:
-		panic(fmt.Sprintf("Unexpected capability value: %v", capability))
-	}
-
-	return ObjectRef{
-		object:     objRef.object,
-		capability: common.NewCapability(cap),
-	}
-}
-
-// Returns the identifier of the object to which this reference
-// refers. From this you can convert to a byte[] which can be useful
-// for example when using the collections library and you wish to use
-// objects as keys.
-func (objRef ObjectRef) Id() *common.VarUUId {
-	if objRef.object == nil {
-		panic("Nil object within objRef")
-	}
-	return common.MakeVarUUId(objRef.id[:])
-}
-
-type objectState struct {
-	*object
-	parentState   *objectState
-	txn           *Txn
-	curVersion    *common.TxnId
-	curValue      []byte
-	curObjectRefs []ObjectRef
-	read          bool
-	write         bool
-	create        bool
-}
-
-func (o *objectState) clone(txn *Txn) *objectState {
-	return &objectState{
-		object:        o.object,
-		parentState:   o,
-		txn:           txn,
-		curVersion:    o.curVersion,
-		curValue:      o.curValue,
-		curObjectRefs: o.curObjectRefs,
-		read:          o.read,
-		write:         o.write,
-		create:        o.create,
-	}
-}
-
-func (o *object) maybeRecordRead(ignoreWritten bool) error {
-	state := o.state
-	if state.create || state.read || (state.write && !ignoreWritten) {
-		return nil
-	}
-	valueRef := state.txn.cache.Get(o.id)
-	if valueRef == nil || valueRef.version == nil {
-		modifiedVars, elapsed, err := loadVar(o.id, o.conn)
-		// fmt.Printf("%p: in txn %p; did load of %v; modified %v\n", state.txn.cache, state.txn, o.id, modifiedVars)
-		if err != nil {
-			return err
-		}
-		if state.txn.varsUpdated(modifiedVars) {
-			return Restart
-		}
-		valueRef = state.txn.cache.Get(o.id)
-		if valueRef == nil || valueRef.version == nil {
-			return fmt.Errorf("Loading var %v failed to find value / update cache", o.id)
-		}
-		// fmt.Printf("%p: %p, load %v -> %v (modifiedVars: %v)\n", state.txn.cache, state.txn, o.id, valueRef.version, modifiedVars)
-		state.txn.stats.Loads[*o.id] = elapsed
-	}
-	state.read = true
-	state.curVersion = valueRef.version
-	if !state.write {
-		state.curValue = valueRef.value
-		refs := make([]ObjectRef, len(valueRef.references))
-		for idx, rc := range valueRef.references {
-			obj, err := state.txn.getObject(rc.vUUId, true)
-			if err != nil {
-				return err
-			}
-			objRef := &refs[idx]
-			objRef.object = obj
-			objRef.capability = rc.capability
-		}
-		state.curObjectRefs = refs
-	}
-	return nil
-}
-
-// Returns the TxnId of the last transaction that wrote to this
-// object. If the error is Restart, you should return Restart as an
-// error in the transaction. This method will error if you do not have
-// the Read capability for this object.
-func (o *object) Version() (*common.TxnId, error) {
-	if o == nil {
-		return nil, errors.New("Cannot call Version() on a nil object")
-	}
-	if err := o.checkCanRead(); err != nil {
-		return nil, err
-	}
-	if err := o.checkExpired(); err != nil {
-		return nil, err
-	}
-	if o.state.create {
-		return nil, nil
-	}
-	if err := o.maybeRecordRead(true); err != nil {
-		return nil, err
-	}
-	return o.state.curVersion, nil
-}
-
-// Returns the current value of this object. Returns a copy of the
-// current value so you are safe to modify it but you will need to
-// call the Set method for any modifications to take effect. If the
-// error is Restart, you should return Restart as an error in the
-// transaction. This method will error if you do not have the Read
-// capability for this object.
-func (o *object) Value() ([]byte, error) {
-	if o == nil {
-		return nil, errors.New("Cannot call Value() on a nil object")
-	}
-	if err := o.checkCanRead(); err != nil {
-		return nil, err
-	}
-	if err := o.checkExpired(); err != nil {
-		return nil, err
-	}
-	if err := o.maybeRecordRead(false); err != nil {
-		return nil, err
-	}
-	c := make([]byte, len(o.state.curValue))
-	copy(c, o.state.curValue)
-	return c, nil
-}
-
-// Returns the slice of objects to which this object refers. Returns a
-// copy of the current references so you are safe to modify it, but
-// you will need to call the Set method for any modifications to take
-// effect. If the error is Restart, you should return Restart as an
-// error in the transaction. This method will error if you do not have
-// the Read capability for this object.
-func (o *object) References() ([]ObjectRef, error) {
-	if o == nil {
-		return nil, errors.New("Cannot call References() on a nil object")
-	}
-	if err := o.checkCanRead(); err != nil {
-		return nil, err
-	}
-	if err := o.checkExpired(); err != nil {
-		return nil, err
-	}
-	if err := o.maybeRecordRead(false); err != nil {
-		return nil, err
-	}
-	rc := make([]ObjectRef, len(o.state.curObjectRefs))
-	copy(rc, o.state.curObjectRefs)
-	return rc, nil
-}
-
-// Returns the current value of this object and the slice of objects
-// to which this object refers. Returns a copy of the current value
-// and a copy of the current references so you are safe to modify them
-// but you will need to call the Set method for any modifications to
-// take effect. If the error is Restart, you should return Restart as
-// an error in the transaction. This method will error if you do not
-// have the Read capability for this object.
-func (o *object) ValueReferences() ([]byte, []ObjectRef, error) {
-	if o == nil {
-		return nil, nil, errors.New("Cannot call ValueReferences() on a nil object")
-	}
-	if err := o.checkCanRead(); err != nil {
-		return nil, nil, err
-	}
-	if err := o.checkExpired(); err != nil {
-		return nil, nil, err
-	}
-	if err := o.maybeRecordRead(false); err != nil {
-		return nil, nil, err
-	}
-	vc := make([]byte, len(o.state.curValue))
-	copy(vc, o.state.curValue)
-	rc := make([]ObjectRef, len(o.state.curObjectRefs))
-	copy(rc, o.state.curObjectRefs)
-	return vc, rc, nil
-}
-
-// Sets the value and references of the current object. If the value
-// contains any references to other objects, they must be explicitly
-// declared as references otherwise on retrieval you will not be able
-// to navigate to those objects. Note that the order of references is
-// stable and may contain duplicates. This method takes copies of both
-// the value and the references so if you modify either after calling
-// this method, your modifications will not take effect. If the error
-// is Restart, you should return Restart as an error in the
-// transaction. This method will error if you do not have the Write
-// capability for this object.
-func (o *object) Set(value []byte, references ...ObjectRef) error {
-	if o == nil {
-		return errors.New("Cannot call Set() on a nil object")
-	}
-	if err := o.checkCanWrite(); err != nil {
 		return err
 	}
-	if err := o.checkExpired(); err != nil {
-		return err
-	}
-	o.state.write = true
-	o.state.curValue = make([]byte, len(value))
-	copy(o.state.curValue, value)
-	o.state.curObjectRefs = make([]ObjectRef, len(references))
-	copy(o.state.curObjectRefs, references)
-	return nil
+	t.determineRestart(modifiedVars)
+
+	return
 }
 
-func (o *object) checkExpired() error {
-	if o.state == nil {
-		return fmt.Errorf("Use of expired object: %v", o.id)
-	} else if o.state.txn.resetInProgress {
-		return Restart
-	}
-	return nil
+func (t *Transaction) empty() {
+	// wipe out all fields of t to force panics if it gets erroneously
+	// reused.
+	t.parent = nil
+	t.connection = nil
+	t.rootCache = nil
+	t.roots = nil
+	t.effects = nil
 }
 
-func (o *object) checkCanRead() error {
-	switch o.ObjectRef.RefCapability() {
-	case Read, ReadWrite:
-		return nil
-	default:
-		return fmt.Errorf("Cannot read object: %v", o.id)
+func (t *Transaction) determineRestart(modifiedVars []*common.VarUUId) {
+	if t.parent == nil {
+		for _, vUUId := range modifiedVars {
+			if _, found := t.effects[*vUUId]; found {
+				t.restartNeeded = true
+				return
+			}
+		}
+	} else {
+		t.parent.determineRestart(modifiedVars)
+		t.restartNeeded = t.parent.restartNeeded
+		if !t.restartNeeded {
+			for _, vUUId := range modifiedVars {
+				if _, found := t.effects[*vUUId]; found {
+					t.restartNeeded = true
+					return
+				}
+			}
+		}
 	}
 }
 
-func (o *object) checkCanWrite() error {
-	switch o.ObjectRef.RefCapability() {
-	case Write, ReadWrite:
-		return nil
-	default:
-		return fmt.Errorf("Cannot write object: %v", o.id)
-	}
-}
-
-func loadVar(vUUId *common.VarUUId, conn *Connection) ([]*common.VarUUId, time.Duration, error) {
-	start := time.Now()
+// the return modifiedVars does not contain vars that are new to us -
+// only values that we already had *fully* loaded in the cache and
+// that have now been modified (either updated or deleted).
+func (t *Transaction) load(vUUId *common.VarUUId) (vr *valueRef, modifiedVars []*common.VarUUId, err error) {
 	seg := capn.NewBuffer(nil)
 	cTxn := msgs.NewClientTxn(seg)
 	actions := msgs.NewClientActionList(seg, 1)
@@ -799,6 +383,13 @@ func loadVar(vUUId *common.VarUUId, conn *Connection) ([]*common.VarUUId, time.D
 	action.SetRead()
 	read := action.Read()
 	read.SetVersion(common.VersionZero[:])
-	_, modifiedVars, err := conn.submitTransaction(&cTxn)
-	return modifiedVars, time.Now().Sub(start), err
+	outcome, modifiedVars, err := t.connection.submitTransaction(&cTxn)
+	if err != nil {
+		return
+	}
+	if outcome.Which() != msgs.CLIENTTXNOUTCOME_ABORT {
+		panic(fmt.Sprintf("When loading %v, failed to get abort outcome!", vUUId))
+	}
+	vr = t.rootCache.Get(vUUId)
+	return
 }

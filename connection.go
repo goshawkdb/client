@@ -22,15 +22,17 @@ type Connection struct {
 	mailbox *actor.Mailbox          // enqueue msgs
 	basic   *actor.BasicServerOuter // ExecFuncAsync
 
-	lock        sync.RWMutex
-	curTxn      *Txn
-	nextVUUId   uint64
-	namespace   []byte
-	nextTxnId   uint64
-	rootVUUIds  map[string]*refCap
-	liveTxn     *connectionMsgTxn
+	lock      sync.Mutex // the lock is for hasTxn, nextVUUId, namespace and cache
+	hasTxn    bool
+	nextVUUId uint64
+	namespace []byte
+	cache     *cache
+
+	nextTxnId uint64
+	roots     map[string]*RefCap
+
+	txnMsg      *connectionMsgTxn
 	conn        *conn
-	cache       *cache
 	rng         *rand.Rand
 	established chan error
 
@@ -47,6 +49,15 @@ type connectionProtocol struct {
 	*Connection
 	*actor.Mailbox
 	*actor.BasicServerOuter // ExecFuncAsync
+}
+
+func (c *Connection) nextVarUUId() *common.VarUUId {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	binary.BigEndian.PutUint64(c.namespace[:8], c.nextVUUId)
+	vUUId := common.MakeVarUUId(c.namespace)
+	c.nextVUUId++
+	return vUUId
 }
 
 // Create a new connection. The hostPort parameter can be either
@@ -113,54 +124,31 @@ func (c *Connection) ShutdownSync() {
 	c.basic.ShutdownSync()
 }
 
-// Run a transaction. The transaction is the function supplied, and
-// the function is invoked potentially several times until it
-// completes successfully: either committing or choosing to abort. The
-// function should therefore be referentially transparent. Returning
-// any non-nil error will cause the transaction to be aborted. The
-// only exception to this rule is that returning Restart when the
-// transaction has identified a restart is required will cause the
-// transaction to be immediately restarted (methods on ObjectRef will
-// return Restart as necessary).
-//
-// The function's final results are returned by this method, along
-// with statistics regarding how the transaction proceeded.
-//
-// This function automatically detects and creates nested
-// transactions: it is perfectly safe (and expected) to call
-// RunTransaction from within a transaction.
-func (c *Connection) RunTransaction(fun func(*Txn) (interface{}, error)) (interface{}, *Stats, error) {
-	roots := c.rootVarUUIds()
-	if roots == nil {
-		return nil, nil, fmt.Errorf("Unable to start transaction: root objects not ready")
+var txnInProgress = errors.New("Transaction already in progress. Use txn.Transact to start a nested txn.")
+
+func (c *Connection) Transact(fun func(*Transaction) (interface{}, error)) (interface{}, error) {
+	c.lock.Lock()
+	if c.hasTxn {
+		c.lock.Unlock()
+		return nil, txnInProgress
+	} else {
+		c.hasTxn = true
 	}
-	var oldTxn *Txn
-	c.lock.Lock()
-	txn := newTxn(fun, c, c.cache, roots, c.curTxn)
-	c.curTxn, oldTxn = txn, c.curTxn
+
+	cache := c.cache
+	roots := c.roots
 	c.lock.Unlock()
-	res, stats, err := txn.run()
+
+	result, err := runRootTxn(fun, c, cache, roots)
+
 	c.lock.Lock()
-	c.curTxn = oldTxn
+	c.hasTxn = false
 	c.lock.Unlock()
-	return res, stats, err
+
+	return result, err
 }
 
-func (c *Connection) rootVarUUIds() map[string]*refCap {
-	c.lock.RLock()
-	defer c.lock.RUnlock()
-	return c.rootVUUIds
-}
-
-func (c *Connection) nextVarUUId() *common.VarUUId {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	binary.BigEndian.PutUint64(c.namespace[:8], c.nextVUUId)
-	vUUId := common.MakeVarUUId(c.namespace)
-	c.nextVUUId++
-	return vUUId
-}
-
+// submitting a txn
 type connectionMsgTxn struct {
 	actor.MsgSyncQuery
 	c            *Connection
@@ -183,9 +171,8 @@ func (msg *connectionMsgTxn) Exec() (bool, error) {
 		msg.setOutcomeError(nil, nil, errors.New("Connection not ready"))
 		return false, nil
 	}
-	if c.liveTxn != nil {
-		msg.setOutcomeError(nil, nil, errors.New("Existing live txn"))
-		return false, nil
+	if c.txnMsg != nil {
+		panic("Should be impossible: existing txnMsg found.")
 	}
 	txn := msg.txn
 	c.lock.Lock()
@@ -196,7 +183,7 @@ func (msg *connectionMsgTxn) Exec() (bool, error) {
 	txnCap := msgs.NewRootClientMessage(seg)
 	txnCap.SetClientTxnSubmission(*txn)
 	if err := c.conn.SendMessage(common.SegToBytes(seg)); err == nil {
-		c.liveTxn = msg
+		c.txnMsg = msg
 		return false, nil
 	} else {
 		msg.setOutcomeError(nil, nil, err)
@@ -215,9 +202,10 @@ func (c *Connection) submitTransaction(txn *msgs.ClientTxn) (*msgs.ClientTxnOutc
 	}
 }
 
+// setup callback from protocol
 type connectionMsgSetup struct {
 	c         *Connection
-	roots     map[string]*refCap
+	roots     map[string]*RefCap
 	namespace []byte
 }
 
@@ -227,10 +215,9 @@ func (msg *connectionMsgSetup) Exec() (bool, error) {
 		panic("Setup called twice.")
 	}
 	c.lock.Lock()
-	c.rootVUUIds = msg.roots
+	c.roots = msg.roots
 	c.namespace = msg.namespace
-	c.cache = newCache()
-	c.cache.SetRoots(msg.roots)
+	c.cache = newCache(msg.roots)
 	c.lock.Unlock()
 	if c.established != nil {
 		close(c.established)
@@ -239,9 +226,11 @@ func (msg *connectionMsgSetup) Exec() (bool, error) {
 	return false, nil
 }
 
-func (cp *connectionProtocol) Setup(roots map[string]*refCap, namespace []byte) {
+func (cp *connectionProtocol) Setup(roots map[string]*RefCap, namespace []byte) {
 	cp.EnqueueMsg(&connectionMsgSetup{c: cp.Connection, roots: roots, namespace: namespace})
 }
+
+// txn outcome received callback from protocol
 
 type connectionMsgTxnOutcome struct {
 	c       *Connection
@@ -252,13 +241,13 @@ func (msg *connectionMsgTxnOutcome) Exec() (bool, error) {
 	c := msg.c
 	outcome := msg.outcome
 	txnId := common.MakeTxnId(outcome.Id())
-	if c.liveTxn == nil {
+	if c.txnMsg == nil {
 		panic(fmt.Sprintf("Received txn outcome for unknown txn: %v", txnId))
 	}
 
 	finalTxnId := common.MakeTxnId(outcome.FinalId())
-	if !bytes.Equal(c.liveTxn.txn.Id(), outcome.Id()) {
-		panic(fmt.Sprintf("Received txn outcome for wrong txn: %v (expecting %v) (final %v) (which %v)", txnId, common.MakeTxnId(c.liveTxn.txn.Id()), finalTxnId, outcome.Which()))
+	if !bytes.Equal(c.txnMsg.txn.Id(), outcome.Id()) {
+		panic(fmt.Sprintf("Received txn outcome for wrong txn: %v (expecting %v) (final %v) (which %v)", txnId, common.MakeTxnId(c.txnMsg.txn.Id()), finalTxnId, outcome.Which()))
 	}
 	final := binary.BigEndian.Uint64(finalTxnId[:8])
 	if final < c.nextTxnId {
@@ -270,15 +259,17 @@ func (msg *connectionMsgTxnOutcome) Exec() (bool, error) {
 	var modifiedVars []*common.VarUUId
 	switch outcome.Which() {
 	case msgs.CLIENTTXNOUTCOME_COMMIT:
-		c.cache.updateFromTxnCommit(c.liveTxn.txn, finalTxnId)
+		c.cache.updateFromTxnCommit(c.txnMsg.txn, finalTxnId)
 	case msgs.CLIENTTXNOUTCOME_ABORT:
 		updates := outcome.Abort()
 		modifiedVars = c.cache.updateFromTxnAbort(&updates)
 	case msgs.CLIENTTXNOUTCOME_ERROR:
 		err = errors.New(outcome.Error())
+	default:
+		panic(fmt.Sprintf("Unexpected txn outcome type! %v", outcome.Which()))
 	}
-	c.liveTxn.setOutcomeError(&outcome, modifiedVars, err)
-	c.liveTxn = nil
+	c.txnMsg.setOutcomeError(&outcome, modifiedVars, err)
+	c.txnMsg = nil
 	return false, nil
 }
 
@@ -286,6 +277,7 @@ func (cp *connectionProtocol) TxnOutcome(outcome msgs.ClientTxnOutcome) {
 	cp.EnqueueMsg(&connectionMsgTxnOutcome{c: cp.Connection, outcome: outcome})
 }
 
+// actory things
 func (ci *connectionInner) Init(self *actor.Actor) (bool, error) {
 	terminate, err := ci.BasicServerInner.Init(self)
 	if terminate || err != nil {
@@ -303,18 +295,21 @@ func (ci *connectionInner) HandleShutdown(err error) bool {
 		ci.conn.Shutdown()
 		ci.conn = nil
 	}
+
 	errShutdown := err
 	if err == nil {
 		errShutdown = actor.MsgShutdown{}
 	}
+
 	if ci.established != nil {
 		ci.established <- errShutdown
 		close(ci.established)
 		ci.established = nil
 	}
-	if ci.liveTxn != nil {
-		ci.liveTxn.setOutcomeError(nil, nil, errShutdown)
-		ci.liveTxn = nil
+
+	if ci.txnMsg != nil {
+		ci.txnMsg.setOutcomeError(nil, nil, errShutdown)
+		ci.txnMsg = nil
 	}
 	return ci.BasicServerInner.HandleShutdown(err)
 }

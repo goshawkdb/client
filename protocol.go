@@ -318,10 +318,10 @@ func (tcc *tlsCapnpClient) finishHandshake() error {
 		if l == 0 {
 			return errors.New("Cluster is not yet formed; Root objects have not been created.")
 		}
-		roots := make(map[string]*refCap, l)
+		roots := make(map[string]*RefCap, l)
 		for idx := 0; idx < l; idx++ {
 			rootCap := rootsCap.At(idx)
-			roots[rootCap.Name()] = &refCap{
+			roots[rootCap.Name()] = &RefCap{
 				vUUId:      common.MakeVarUUId(rootCap.VarId()),
 				capability: common.NewCapability(rootCap.Capability()),
 			}
