@@ -90,6 +90,7 @@ func (t *Transaction) Retry() (err error) {
 			}
 		}
 	}
+	DebugLog(t.connection.inner.Logger, "debug", "retry", "reads", reads)
 	if len(reads) == 0 {
 		return noReads
 	}
@@ -155,7 +156,7 @@ func (t *Transaction) Read(ref RefCap) (value []byte, refs []RefCap, err error) 
 		e.curRefs = vr.references
 		t.determineRestart(modifiedVars)
 		if t.restartNeeded {
-			return nil, nil, restartNeeded
+			return nil, nil, nil
 		}
 	}
 
