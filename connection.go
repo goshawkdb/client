@@ -36,6 +36,11 @@ type Connection struct {
 	rng         *rand.Rand
 	established chan error
 
+	submittedCount   uint64
+	committedCount   uint64
+	restartedCount   uint64
+	sumServerLatency time.Duration
+
 	inner connectionInner
 	proto connectionProtocol
 }
@@ -152,6 +157,7 @@ func (c *Connection) Transact(fun func(*Transaction) (interface{}, error)) (inte
 type connectionMsgTxn struct {
 	actor.MsgSyncQuery
 	c            *Connection
+	started      time.Time
 	txn          *msgs.ClientTxn
 	outcome      *msgs.ClientTxnOutcome
 	modifiedVars []*common.VarUUId
@@ -174,6 +180,7 @@ func (msg *connectionMsgTxn) Exec() (bool, error) {
 	if c.txnMsg != nil {
 		panic("Should be impossible: existing txnMsg found.")
 	}
+	started := time.Now()
 	txn := msg.txn
 	c.lock.Lock()
 	binary.BigEndian.PutUint64(c.namespace[:8], c.nextTxnId)
@@ -183,7 +190,9 @@ func (msg *connectionMsgTxn) Exec() (bool, error) {
 	txnCap := msgs.NewRootClientMessage(seg)
 	txnCap.SetClientTxnSubmission(*txn)
 	if err := c.conn.SendMessage(common.SegToBytes(seg)); err == nil {
+		c.submittedCount++
 		c.txnMsg = msg
+		msg.started = started
 		return false, nil
 	} else {
 		msg.setOutcomeError(nil, nil, err)
@@ -217,7 +226,7 @@ func (msg *connectionMsgSetup) Exec() (bool, error) {
 	c.lock.Lock()
 	c.roots = msg.roots
 	c.namespace = msg.namespace
-	c.cache = newCache(msg.roots)
+	c.cache = newCache(msg.roots, c.inner.Logger)
 	c.lock.Unlock()
 	if c.established != nil {
 		close(c.established)
@@ -255,12 +264,16 @@ func (msg *connectionMsgTxnOutcome) Exec() (bool, error) {
 	}
 	c.nextTxnId = final + 1 + uint64(c.rng.Intn(8))
 
+	c.sumServerLatency += time.Now().Sub(c.txnMsg.started)
+
 	var err error
 	var modifiedVars []*common.VarUUId
 	switch outcome.Which() {
 	case msgs.CLIENTTXNOUTCOME_COMMIT:
+		c.committedCount++
 		c.cache.updateFromTxnCommit(c.txnMsg.txn, finalTxnId)
 	case msgs.CLIENTTXNOUTCOME_ABORT:
+		c.restartedCount++
 		updates := outcome.Abort()
 		modifiedVars = c.cache.updateFromTxnAbort(&updates)
 	case msgs.CLIENTTXNOUTCOME_ERROR:
@@ -291,6 +304,12 @@ func (ci *connectionInner) Init(self *actor.Actor) (bool, error) {
 }
 
 func (ci *connectionInner) HandleShutdown(err error) bool {
+	ci.Logger.Log(
+		"submitted", ci.submittedCount,
+		"committed", ci.committedCount,
+		"restarted", ci.restartedCount,
+		"avgLatency", ci.sumServerLatency/time.Duration(ci.submittedCount))
+
 	if ci.conn != nil {
 		ci.conn.Shutdown()
 		ci.conn = nil

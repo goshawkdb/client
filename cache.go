@@ -2,6 +2,7 @@ package client
 
 import (
 	"fmt"
+	"github.com/go-kit/kit/log"
 	"goshawkdb.io/common"
 	msgs "goshawkdb.io/common/capnp"
 	"sync"
@@ -16,54 +17,34 @@ type valueRef struct {
 	references []RefCap
 }
 
-// reference to some other var. Also contains a capability.
-type RefCap struct {
-	vUUId      *common.VarUUId
-	capability *common.Capability
-}
-
-func (rc RefCap) String() string {
-	return fmt.Sprintf("%v(%v)", rc.vUUId, rc.capability)
-}
-
-func (rc RefCap) DenyRead() RefCap {
-	return RefCap{
-		vUUId:      rc.vUUId,
-		capability: rc.capability.DenyRead(),
-	}
-}
-
-func (rc RefCap) DenyWrite() RefCap {
-	return RefCap{
-		vUUId:      rc.vUUId,
-		capability: rc.capability.DenyWrite(),
-	}
-}
-
 type cache struct {
-	sync.RWMutex
-	m map[common.VarUUId]*valueRef
+	m      map[common.VarUUId]*valueRef
+	lock   sync.RWMutex
+	logger log.Logger
 }
 
-func newCache(roots map[string]*RefCap) *cache {
+func newCache(roots map[string]*RefCap, logger log.Logger) *cache {
 	m := make(map[common.VarUUId]*valueRef)
 	for _, rc := range roots {
 		m[*rc.vUUId] = &valueRef{capability: rc.capability}
 	}
-	return &cache{m: m}
+	return &cache{
+		m:      m,
+		logger: logger,
+	}
 }
 
 func (c *cache) Get(vUUId *common.VarUUId) *valueRef {
-	c.RLock()
-	defer c.RUnlock()
+	c.lock.RLock()
+	defer c.lock.RUnlock()
 	return c.m[*vUUId]
 }
 
 func (c *cache) updateFromTxnCommit(txn *msgs.ClientTxn, txnId *common.TxnId) {
-	// fmt.Println("Updating from commit")
+	DebugLog(c.logger, "debug", "updating from commit")
 	actions := txn.Actions()
-	c.Lock()
-	defer c.Unlock()
+	c.lock.Lock()
+	defer c.lock.Unlock()
 	for idx, l := 0, actions.Len(); idx < l; idx++ {
 		action := actions.At(idx)
 		vUUId := common.MakeVarUUId(action.VarId())
@@ -89,10 +70,10 @@ func (c *cache) updateFromTxnCommit(txn *msgs.ClientTxn, txnId *common.TxnId) {
 }
 
 func (c *cache) updateFromTxnAbort(updates *msgs.ClientUpdate_List) []*common.VarUUId {
-	// fmt.Println("Updating from abort")
+	DebugLog(c.logger, "debug", "updating from abort")
 	modifiedVars := make([]*common.VarUUId, 0, updates.Len())
-	c.Lock()
-	defer c.Unlock()
+	c.lock.Lock()
+	defer c.lock.Unlock()
 	for idx, l := 0, updates.Len(); idx < l; idx++ {
 		update := updates.At(idx)
 		txnId := common.MakeTxnId(update.Version())
@@ -100,7 +81,7 @@ func (c *cache) updateFromTxnAbort(updates *msgs.ClientUpdate_List) []*common.Va
 		for idy, m := 0, actions.Len(); idy < m; idy++ {
 			action := actions.At(idy)
 			vUUId := common.MakeVarUUId(action.VarId())
-			// fmt.Printf("abort %v@%v ", vUUId, txnId)
+			DebugLog(c.logger, "debug", "abort", "vUUId", vUUId, "txnId", txnId)
 			switch action.Which() {
 			case msgs.CLIENTACTION_DELETE:
 				c.updateFromDelete(vUUId, txnId)
@@ -118,14 +99,14 @@ func (c *cache) updateFromTxnAbort(updates *msgs.ClientUpdate_List) []*common.Va
 			}
 		}
 	}
-	// fmt.Println(".")
+	DebugLog(c.logger, "debug", "updating from abort...done")
 	return modifiedVars
 }
 
 func (c *cache) updateFromDelete(vUUId *common.VarUUId, txnId *common.TxnId) {
-	// fmt.Printf("%p: updateFromDelete for %v at %v\n", c, vUUId, txnId)
+	DebugLog(c.logger, "debug", "updateFromDelete", "vUUId", vUUId, "txnId", txnId)
 	if vr, found := c.m[*vUUId]; found && vr.version != nil && vr.version.Compare(txnId) != common.EQ {
-		// fmt.Printf("%p: %v removed from cache (req ver: %v; found ver: %v)\n", c, vUUId, txnId, vr.version)
+		DebugLog(c.logger, "debug", "removed from cache", "vUUId", vUUId, "required", txnId, "existing", vr.version)
 		// nb. we do not wipe out the capabilities nor the vr itself!
 		vr.version = nil
 		vr.value = nil
@@ -152,7 +133,7 @@ func (c *cache) updateFromWrite(txnId *common.TxnId, vUUId *common.VarUUId, valu
 	if created {
 		vr.capability = common.ReadWriteCapability
 	}
-	// fmt.Printf("%p: %v updated (%v -> %v)\n", c, vUUId, vr.version, txnId)
+	existing := vr.version
 	vr.references = references
 	vr.version = txnId
 	vr.value = value
@@ -170,6 +151,6 @@ func (c *cache) updateFromWrite(txnId *common.TxnId, vUUId *common.VarUUId, valu
 			c.m[*rc.vUUId] = vr
 		}
 	}
-	// fmt.Printf("%v@%v (%v)\n   (-> %v)\n", vUUId, txnId, value, references)
+	DebugLog(c.logger, "debug", "updated", "vUUId", vUUId, "existing", existing, "new", txnId, "references", references)
 	return updated
 }

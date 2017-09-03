@@ -6,6 +6,7 @@ import (
 	capn "github.com/glycerine/go-capnproto"
 	"goshawkdb.io/common"
 	msgs "goshawkdb.io/common/capnp"
+	"sync"
 )
 
 type Transaction struct {
@@ -18,6 +19,9 @@ type Transaction struct {
 	effects       map[common.VarUUId]*effect
 	restartNeeded bool
 	aborted       bool
+
+	hasChild bool
+	lock     sync.Mutex
 }
 
 func runRootTxn(fun func(*Transaction) (interface{}, error), c *Connection, cache *cache, roots map[string]*RefCap) (interface{}, error) {
@@ -33,13 +37,29 @@ func (t *Transaction) Transact(fun func(*Transaction) (interface{}, error)) (int
 	if err := t.valid(); err != nil {
 		return nil, err
 	}
+	t.lock.Lock()
+	if t.hasChild {
+		t.lock.Unlock()
+		return nil, txnInProgress
+	} else {
+		t.hasChild = true
+	}
+
 	c := &Transaction{
 		parent:     t,
 		connection: t.connection,
 		rootCache:  t.rootCache,
 		roots:      t.roots,
 	}
-	return c.run(fun)
+	t.lock.Unlock()
+
+	result, err := c.run(fun)
+
+	t.lock.Lock()
+	t.hasChild = false
+	t.lock.Unlock()
+
+	return result, err
 }
 
 func (t *Transaction) Root(name string) *RefCap {
@@ -125,6 +145,7 @@ func (t *Transaction) Read(ref RefCap) (value []byte, refs []RefCap, err error) 
 	if e.root != nil && !e.root.capability.CanRead() {
 		return nil, nil, noReadCap
 	}
+
 	if e.curRefs == nil { // we need to load it
 		vr, modifiedVars, err := t.load(ref.vUUId)
 		if err != nil {
@@ -138,6 +159,7 @@ func (t *Transaction) Read(ref RefCap) (value []byte, refs []RefCap, err error) 
 		}
 	}
 
+	t.effects[*ref.vUUId] = e
 	// we read the original if we haven't written it yet, and we didn't create it
 	e.origRead = e.origRead || (!e.origWritten && e.root != nil)
 
@@ -146,6 +168,18 @@ func (t *Transaction) Read(ref RefCap) (value []byte, refs []RefCap, err error) 
 	refs = make([]RefCap, len(e.curRefs))
 	copy(refs, e.curRefs)
 	return
+}
+
+func (t *Transaction) ObjectCapability(ref RefCap) (*common.Capability, error) {
+	if err := t.valid(); err != nil {
+		return nil, err
+	}
+	e := t.find(ref.vUUId, false)
+	if e.root == nil {
+		return common.ReadWriteCapability, nil
+	} else {
+		return e.root.capability, nil
+	}
 }
 
 func (t *Transaction) Write(ref RefCap, value []byte, refs ...RefCap) (err error) {
@@ -157,6 +191,7 @@ func (t *Transaction) Write(ref RefCap, value []byte, refs ...RefCap) (err error
 		return noWriteCap
 	}
 
+	t.effects[*ref.vUUId] = e
 	// we wrote to the original if we haven't created it
 	e.origWritten = e.origWritten || e.root != nil
 
@@ -221,11 +256,8 @@ func (t *Transaction) find(vUUId *common.VarUUId, clone bool) *effect {
 		e := t.parent.find(vUUId, false)
 		if clone {
 			e = e.clone()
-			t.effects[*vUUId] = e
-			return e
-		} else {
-			return e
 		}
+		return e
 	} else if vr := t.rootCache.Get(vUUId); vr == nil {
 		panic(fmt.Sprintf("Attempt to fetch unknown object: %v", vUUId))
 	} else {
@@ -233,9 +265,6 @@ func (t *Transaction) find(vUUId *common.VarUUId, clone bool) *effect {
 			root:     vr,
 			curValue: vr.value,
 			curRefs:  vr.references,
-		}
-		if clone {
-			t.effects[*vUUId] = e
 		}
 		return e
 	}
@@ -246,8 +275,12 @@ func (t *Transaction) run(fun func(*Transaction) (interface{}, error)) (result i
 
 	for {
 		t.restartNeeded = false
-		t.effects = make(map[common.VarUUId]*effect)
+		t.effects = make(map[common.VarUUId]*effect, 16+len(t.effects))
 		result, err = fun(t)
+
+		DebugLog(t.connection.inner.Logger,
+			"debug", "postRun", "result", result, "error", err,
+			"aborted", t.aborted, "restartNeeded", t.restartNeeded, "nilParent", t.parent == nil)
 
 		switch {
 		case err != nil || t.aborted:
@@ -257,8 +290,11 @@ func (t *Transaction) run(fun func(*Transaction) (interface{}, error)) (result i
 		case t.restartNeeded:
 			return
 		case t.parent == nil:
-			err = t.commitToServer()
-			return
+			if err = t.commitToServer(); err == nil && t.restartNeeded {
+				continue
+			} else {
+				return
+			}
 		default:
 			t.commitToParent()
 			return
@@ -293,7 +329,7 @@ func (t *Transaction) commitToServer() (err error) {
 	actions := msgs.NewClientActionList(seg, len(t.effects))
 	cTxn.SetActions(actions)
 	idx := 0
-	t.connection.inner.Logger.Log("msg", "starting submission.")
+	DebugLog(t.connection.inner.Logger, "debug", "creating submission.")
 
 	for vUUId, e := range t.effects {
 		action := actions.At(idx)
@@ -301,33 +337,33 @@ func (t *Transaction) commitToServer() (err error) {
 		action.SetVarId(vUUId[:])
 		switch {
 		case e.root == nil:
-			t.connection.inner.Logger.Log("action", "created", "vUUId", vUUId)
+			DebugLog(t.connection.inner.Logger, "vUUId", vUUId, "action", "created")
 			action.SetCreate()
 			create := action.Create()
 			create.SetValue(e.curValue)
 			e.setRefs(seg, create.SetReferences)
 		case e.origRead && e.origWritten:
-			t.connection.inner.Logger.Log("action", "rw", "vUUId", vUUId)
+			DebugLog(t.connection.inner.Logger, "vUUId", vUUId, "action", "rw")
 			action.SetReadwrite()
 			rw := action.Readwrite()
 			rw.SetVersion(e.root.version[:])
 			rw.SetValue(e.curValue)
 			e.setRefs(seg, rw.SetReferences)
 		case e.origRead:
-			t.connection.inner.Logger.Log("action", "read", "vUUId", vUUId)
+			DebugLog(t.connection.inner.Logger, "vUUId", vUUId, "action", "read")
 			action.SetRead()
 			action.Read().SetVersion(e.root.version[:])
 		case e.origWritten:
-			t.connection.inner.Logger.Log("action", "wrote", "vUUId", vUUId)
+			DebugLog(t.connection.inner.Logger, "vUUId", vUUId, "action", "wrote")
 			action.SetWrite()
 			write := action.Write()
 			write.SetValue(e.curValue)
 			e.setRefs(seg, write.SetReferences)
 		default:
-			panic(fmt.Sprintf("Effect appears to be a noop! %#v", e))
+			panic(fmt.Sprintf("Effect appears to be a noop! %v %#v", vUUId, e))
 		}
 	}
-	t.connection.inner.Logger.Log("msg", "submitting")
+	DebugLog(t.connection.inner.Logger, "debug", "submitting")
 
 	_, modifiedVars, err := t.connection.submitTransaction(&cTxn)
 	if err != nil {
