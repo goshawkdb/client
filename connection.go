@@ -304,11 +304,18 @@ func (ci *connectionInner) Init(self *actor.Actor) (bool, error) {
 }
 
 func (ci *connectionInner) HandleShutdown(err error) bool {
-	ci.Logger.Log(
-		"submitted", ci.submittedCount,
-		"committed", ci.committedCount,
-		"restarted", ci.restartedCount,
-		"avgLatency", ci.sumServerLatency/time.Duration(ci.submittedCount))
+	if ci.submittedCount == 0 {
+		ci.Logger.Log(
+			"submitted", ci.submittedCount,
+			"committed", ci.committedCount,
+			"restarted", ci.restartedCount)
+	} else {
+		ci.Logger.Log(
+			"submitted", ci.submittedCount,
+			"committed", ci.committedCount,
+			"restarted", ci.restartedCount,
+			"avgLatency", ci.sumServerLatency/time.Duration(ci.submittedCount))
+	}
 
 	if ci.conn != nil {
 		ci.conn.Shutdown()
