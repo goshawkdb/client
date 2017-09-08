@@ -24,6 +24,10 @@ type Transaction struct {
 	lock     sync.Mutex
 }
 
+type Transactor interface {
+	Transact(fun func(*Transaction) (interface{}, error)) (interface{}, error)
+}
+
 func runRootTxn(fun func(*Transaction) (interface{}, error), c *Connection, cache *cache, roots map[string]*RefCap) (interface{}, error) {
 	txn := &Transaction{
 		connection: c,
