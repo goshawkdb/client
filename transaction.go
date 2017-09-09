@@ -21,7 +21,7 @@ type Transaction struct {
 	aborted       bool
 
 	hasChild bool
-	lock     sync.Mutex
+	lock     *sync.Mutex
 }
 
 type Transactor interface {
@@ -33,15 +33,16 @@ func runRootTxn(fun func(*Transaction) (interface{}, error), c *Connection, cach
 		connection: c,
 		rootCache:  cache,
 		roots:      roots,
+		lock:       new(sync.Mutex),
 	}
 	return txn.run(fun)
 }
 
 func (t *Transaction) Transact(fun func(*Transaction) (interface{}, error)) (interface{}, error) {
+	t.lock.Lock()
 	if err := t.valid(); err != nil {
 		return nil, err
 	}
-	t.lock.Lock()
 	if t.hasChild {
 		t.lock.Unlock()
 		return nil, txnInProgress
@@ -54,6 +55,7 @@ func (t *Transaction) Transact(fun func(*Transaction) (interface{}, error)) (int
 		connection: t.connection,
 		rootCache:  t.rootCache,
 		roots:      t.roots,
+		lock:       t.lock,
 	}
 	t.lock.Unlock()
 
@@ -66,11 +68,14 @@ func (t *Transaction) Transact(fun func(*Transaction) (interface{}, error)) (int
 	return result, err
 }
 
-func (t *Transaction) Root(name string) *RefCap {
-	return t.roots[name]
+func (t *Transaction) Root(name string) (RefCap, bool) {
+	rc, found := t.roots[name]
+	return *rc, found
 }
 
 func (t *Transaction) Abort() (err error) {
+	t.lock.Lock()
+	defer t.lock.Unlock()
 	if err = t.valid(); err != nil {
 		return
 	}
@@ -79,10 +84,14 @@ func (t *Transaction) Abort() (err error) {
 }
 
 func (t *Transaction) RestartNeeded() bool {
+	t.lock.Lock()
+	defer t.lock.Unlock()
 	return t.restartNeeded
 }
 
 func (t *Transaction) Retry() (err error) {
+	t.lock.Lock()
+	defer t.lock.Unlock()
 	if err = t.valid(); err != nil {
 		return
 	}
@@ -143,6 +152,8 @@ func (t *Transaction) valid() error {
 }
 
 func (t *Transaction) Read(ref RefCap) (value []byte, refs []RefCap, err error) {
+	t.lock.Lock()
+	defer t.lock.Unlock()
 	if err = t.valid(); err != nil {
 		return
 	}
@@ -176,6 +187,8 @@ func (t *Transaction) Read(ref RefCap) (value []byte, refs []RefCap, err error) 
 }
 
 func (t *Transaction) ObjectCapability(ref RefCap) (*common.Capability, error) {
+	t.lock.Lock()
+	defer t.lock.Unlock()
 	if err := t.valid(); err != nil {
 		return nil, err
 	}
@@ -188,6 +201,8 @@ func (t *Transaction) ObjectCapability(ref RefCap) (*common.Capability, error) {
 }
 
 func (t *Transaction) Write(ref RefCap, value []byte, refs ...RefCap) (err error) {
+	t.lock.Lock()
+	defer t.lock.Unlock()
 	if err = t.valid(); err != nil {
 		return
 	}
@@ -211,6 +226,8 @@ func (t *Transaction) Write(ref RefCap, value []byte, refs ...RefCap) (err error
 }
 
 func (t *Transaction) Create(value []byte, refs ...RefCap) (ref RefCap, err error) {
+	t.lock.Lock()
+	defer t.lock.Unlock()
 	if err = t.valid(); err != nil {
 		return
 	}
@@ -276,17 +293,22 @@ func (t *Transaction) find(vUUId *common.VarUUId, clone bool) *effect {
 }
 
 func (t *Transaction) run(fun func(*Transaction) (interface{}, error)) (result interface{}, err error) {
+	t.lock.Lock()
+	defer t.lock.Unlock()
 	defer t.empty()
 
 	for {
 		t.restartNeeded = false
 		t.effects = make(map[common.VarUUId]*effect, 16+len(t.effects))
+		t.lock.Unlock()
+
 		result, err = fun(t)
 
 		DebugLog(t.connection.inner.Logger,
 			"debug", "postRun", "result", result, "error", err,
 			"aborted", t.aborted, "restartNeeded", t.restartNeeded, "nilParent", t.parent == nil)
 
+		t.lock.Lock()
 		switch {
 		case err != nil || t.aborted:
 			return

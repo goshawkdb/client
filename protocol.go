@@ -272,7 +272,7 @@ func (tcc *tlsCapnpClient) finishHandshake() error {
 				PrivateKey:  tcc.clientPrivKey,
 			},
 		},
-		CipherSuites:             []uint16{tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
+		CipherSuites:             []uint16{tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305},
 		MinVersion:               tls.VersionTLS12,
 		PreferServerCipherSuites: true,
 		RootCAs:                  roots,
