@@ -139,6 +139,7 @@ var (
 	aborted       = errors.New("Transaction has been aborted.")
 	restartNeeded = errors.New("Restart needed.")
 	noReads       = errors.New("Cannot retry: transaction never made any reads.")
+	childExists   = errors.New("Illegal attempt to access parent transaction whilst child exists.")
 )
 
 func (t *Transaction) valid() error {
@@ -146,6 +147,8 @@ func (t *Transaction) valid() error {
 		return aborted
 	} else if t.restartNeeded {
 		return restartNeeded
+	} else if t.hasChild {
+		return childExists
 	} else {
 		return nil
 	}
