@@ -8,7 +8,7 @@ import (
 // reference to some other var. Also contains a capability.
 type RefCap struct {
 	vUUId      *common.VarUUId
-	capability *common.Capability
+	capability common.Capability
 }
 
 func (rc RefCap) String() string {
@@ -41,7 +41,7 @@ func (a RefCap) SameReferent(b RefCap) bool {
 	return a.vUUId.Compare(b.vUUId) == common.EQ
 }
 
-func (rc RefCap) GrantCapability(cap *common.Capability) RefCap {
+func (rc RefCap) GrantCapability(cap common.Capability) RefCap {
 	return RefCap{
 		vUUId:      rc.vUUId,
 		capability: cap,
@@ -52,6 +52,6 @@ func (rc RefCap) Id() *common.VarUUId {
 	return rc.vUUId
 }
 
-func (rc RefCap) RefCapability() *common.Capability {
+func (rc RefCap) RefCapability() common.Capability {
 	return rc.capability
 }

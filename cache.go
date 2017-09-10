@@ -12,7 +12,7 @@ import (
 // for the value.
 type valueRef struct {
 	version    *common.TxnId
-	capability *common.Capability
+	capability common.Capability
 	value      []byte
 	references []RefCap
 }

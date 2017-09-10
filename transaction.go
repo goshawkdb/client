@@ -189,11 +189,11 @@ func (t *Transaction) Read(ref RefCap) (value []byte, refs []RefCap, err error) 
 	return
 }
 
-func (t *Transaction) ObjectCapability(ref RefCap) (*common.Capability, error) {
+func (t *Transaction) ObjectCapability(ref RefCap) (common.Capability, error) {
 	t.lock.Lock()
 	defer t.lock.Unlock()
 	if err := t.valid(); err != nil {
-		return nil, err
+		return common.NoneCapability, err
 	}
 	e := t.find(ref.vUUId, false)
 	if e.root == nil {
@@ -269,7 +269,7 @@ func (e *effect) setRefs(seg *capn.Segment, setter func(msgs.ClientVarIdPos_List
 	for idx, rc := range e.curRefs {
 		ref := refs.At(idx)
 		ref.SetVarId(rc.vUUId[:])
-		ref.SetCapability(rc.capability.Capability)
+		ref.SetCapability(rc.capability.AsMsg())
 	}
 	setter(refs)
 }
