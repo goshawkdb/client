@@ -272,7 +272,7 @@ func (tcc *tlsCapnpClient) finishHandshake() error {
 				PrivateKey:  tcc.clientPrivKey,
 			},
 		},
-		CipherSuites:             []uint16{tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
+		CipherSuites:             []uint16{tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305},
 		MinVersion:               tls.VersionTLS12,
 		PreferServerCipherSuites: true,
 		RootCAs:                  roots,
@@ -318,10 +318,10 @@ func (tcc *tlsCapnpClient) finishHandshake() error {
 		if l == 0 {
 			return errors.New("Cluster is not yet formed; Root objects have not been created.")
 		}
-		roots := make(map[string]*refCap, l)
+		roots := make(map[string]*RefCap, l)
 		for idx := 0; idx < l; idx++ {
 			rootCap := rootsCap.At(idx)
-			roots[rootCap.Name()] = &refCap{
+			roots[rootCap.Name()] = &RefCap{
 				vUUId:      common.MakeVarUUId(rootCap.VarId()),
 				capability: common.NewCapability(rootCap.Capability()),
 			}

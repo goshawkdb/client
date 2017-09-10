@@ -2,55 +2,49 @@ package client
 
 import (
 	"fmt"
+	"github.com/go-kit/kit/log"
 	"goshawkdb.io/common"
 	msgs "goshawkdb.io/common/capnp"
 	"sync"
 )
 
+// Value with references. Holds the union of all capabilites received
+// for the value.
 type valueRef struct {
 	version    *common.TxnId
-	capability *common.Capability
+	capability common.Capability
 	value      []byte
-	references []refCap
-}
-
-type refCap struct {
-	vUUId      *common.VarUUId
-	capability *common.Capability
-}
-
-func (rc refCap) String() string {
-	return fmt.Sprintf("%v(%v)", rc.vUUId, rc.capability)
+	references []RefCap
 }
 
 type cache struct {
-	sync.RWMutex
-	m map[common.VarUUId]*valueRef
+	m      map[common.VarUUId]*valueRef
+	lock   sync.RWMutex
+	logger log.Logger
 }
 
-func newCache() *cache {
+func newCache(roots map[string]*RefCap, logger log.Logger) *cache {
+	m := make(map[common.VarUUId]*valueRef)
+	for _, rc := range roots {
+		m[*rc.vUUId] = &valueRef{capability: rc.capability}
+	}
 	return &cache{
-		m: make(map[common.VarUUId]*valueRef),
+		m:      m,
+		logger: logger,
 	}
 }
 
 func (c *cache) Get(vUUId *common.VarUUId) *valueRef {
-	c.RLock()
-	defer c.RUnlock()
+	c.lock.RLock()
+	defer c.lock.RUnlock()
 	return c.m[*vUUId]
 }
 
-func (c *cache) SetRoots(roots map[string]*refCap) {
-	for _, rc := range roots {
-		c.m[*rc.vUUId] = &valueRef{capability: rc.capability}
-	}
-}
-
 func (c *cache) updateFromTxnCommit(txn *msgs.ClientTxn, txnId *common.TxnId) {
-	// fmt.Println("Updating from commit")
+	DebugLog(c.logger, "debug", "updating from commit")
 	actions := txn.Actions()
-	c.Lock()
-	defer c.Unlock()
+	c.lock.Lock()
+	defer c.lock.Unlock()
 	for idx, l := 0, actions.Len(); idx < l; idx++ {
 		action := actions.At(idx)
 		vUUId := common.MakeVarUUId(action.VarId())
@@ -69,15 +63,17 @@ func (c *cache) updateFromTxnCommit(txn *msgs.ClientTxn, txnId *common.TxnId) {
 			c.updateFromWrite(txnId, vUUId, create.Value(), &refs, true)
 		case msgs.CLIENTACTION_READ:
 			// do nothing
+		default:
+			panic(fmt.Sprintf("Unexpected action! %v", action.Which()))
 		}
 	}
 }
 
 func (c *cache) updateFromTxnAbort(updates *msgs.ClientUpdate_List) []*common.VarUUId {
-	// fmt.Println("Updating from abort")
+	DebugLog(c.logger, "debug", "updating from abort")
 	modifiedVars := make([]*common.VarUUId, 0, updates.Len())
-	c.Lock()
-	defer c.Unlock()
+	c.lock.Lock()
+	defer c.lock.Unlock()
 	for idx, l := 0, updates.Len(); idx < l; idx++ {
 		update := updates.At(idx)
 		txnId := common.MakeTxnId(update.Version())
@@ -85,7 +81,7 @@ func (c *cache) updateFromTxnAbort(updates *msgs.ClientUpdate_List) []*common.Va
 		for idy, m := 0, actions.Len(); idy < m; idy++ {
 			action := actions.At(idy)
 			vUUId := common.MakeVarUUId(action.VarId())
-			// fmt.Printf("abort %v@%v ", vUUId, txnId)
+			DebugLog(c.logger, "debug", "abort", "vUUId", vUUId, "txnId", txnId)
 			switch action.Which() {
 			case msgs.CLIENTACTION_DELETE:
 				c.updateFromDelete(vUUId, txnId)
@@ -103,14 +99,15 @@ func (c *cache) updateFromTxnAbort(updates *msgs.ClientUpdate_List) []*common.Va
 			}
 		}
 	}
-	// fmt.Println(".")
+	DebugLog(c.logger, "debug", "updating from abort...done")
 	return modifiedVars
 }
 
 func (c *cache) updateFromDelete(vUUId *common.VarUUId, txnId *common.TxnId) {
-	// fmt.Printf("%p: updateFromDelete for %v at %v\n", c, vUUId, txnId)
+	DebugLog(c.logger, "debug", "updateFromDelete", "vUUId", vUUId, "txnId", txnId)
 	if vr, found := c.m[*vUUId]; found && vr.version != nil && vr.version.Compare(txnId) != common.EQ {
-		// fmt.Printf("%p: %v removed from cache (req ver: %v; found ver: %v)\n", c, vUUId, txnId, vr.version)
+		DebugLog(c.logger, "debug", "removed from cache", "vUUId", vUUId, "required", txnId, "existing", vr.version)
+		// nb. we do not wipe out the capabilities nor the vr itself!
 		vr.version = nil
 		vr.value = nil
 		vr.references = nil
@@ -123,21 +120,20 @@ func (c *cache) updateFromDelete(vUUId *common.VarUUId, txnId *common.TxnId) {
 
 func (c *cache) updateFromWrite(txnId *common.TxnId, vUUId *common.VarUUId, value []byte, refs *msgs.ClientVarIdPos_List, created bool) bool {
 	vr, found := c.m[*vUUId]
-	updated := found && vr.version != nil
-	references := make([]refCap, refs.Len())
+	updated := found && vr.references != nil
+	references := make([]RefCap, refs.Len())
 	switch {
 	case updated && vr.version.Compare(txnId) == common.EQ:
 		panic(fmt.Sprint("Divergence discovered on update of ", vUUId, ": server thinks we don't have ", txnId, " but we do!"))
-		return false
 	case found:
 	default:
 		vr = &valueRef{}
 		c.m[*vUUId] = vr
 	}
 	if created {
-		vr.capability = common.MaxCapability
+		vr.capability = common.ReadWriteCapability
 	}
-	// fmt.Printf("%p: %v updated (%v -> %v)\n", c, vUUId, vr.version, txnId)
+	existing := vr.version
 	vr.references = references
 	vr.version = txnId
 	vr.value = value
@@ -155,6 +151,6 @@ func (c *cache) updateFromWrite(txnId *common.TxnId, vUUId *common.VarUUId, valu
 			c.m[*rc.vUUId] = vr
 		}
 	}
-	// fmt.Printf("%v@%v (%v)\n   (-> %v)\n", vUUId, txnId, value, references)
+	DebugLog(c.logger, "debug", "updated", "vUUId", vUUId, "existing", existing, "new", txnId, "references", references)
 	return updated
 }
