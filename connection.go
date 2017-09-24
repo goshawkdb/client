@@ -271,7 +271,7 @@ func (msg *connectionMsgTxnOutcome) Exec() (bool, error) {
 	switch outcome.Which() {
 	case msgs.CLIENTTXNOUTCOME_COMMIT:
 		c.committedCount++
-		c.cache.updateFromTxnCommit(c.txnMsg.txn, finalTxnId)
+		c.cache.updateFromTxnCommit(c.txnMsg.txn)
 	case msgs.CLIENTTXNOUTCOME_ABORT:
 		c.restartedCount++
 		updates := outcome.Abort()

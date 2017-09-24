@@ -95,11 +95,11 @@ func (t *Transaction) Retry() (err error) {
 	if err = t.valid(); err != nil {
 		return
 	}
-	reads := make(map[common.VarUUId]*valueRef)
+	reads := make(map[common.VarUUId]bool)
 	for cur := t; cur != nil; cur = cur.parent {
 		for vUUId, e := range cur.effects {
 			if e.origRead {
-				reads[vUUId] = e.root
+				reads[vUUId] = true
 			}
 		}
 	}
@@ -114,11 +114,11 @@ func (t *Transaction) Retry() (err error) {
 	actions := msgs.NewClientActionList(seg, len(reads))
 	cTxn.SetActions(actions)
 	idx := 0
-	for vUUId, vr := range reads {
+	for vUUId := range reads {
 		action := actions.At(idx)
 		action.SetVarId(vUUId[:])
-		action.SetRead()
-		action.Read().SetVersion(vr.version[:])
+		action.SetUnmodified()
+		action.SetActionType(msgs.CLIENTACTIONTYPE_READONLY)
 		idx++
 	}
 	outcome, modifiedVars, err := t.connection.submitTransaction(&cTxn)
@@ -365,32 +365,31 @@ func (t *Transaction) commitToServer() (err error) {
 		action := actions.At(idx)
 		idx++
 		action.SetVarId(vUUId[:])
+		setMod := true
 		switch {
 		case e.root == nil:
 			DebugLog(t.connection.inner.Logger, "vUUId", vUUId, "action", "created")
-			action.SetCreate()
-			create := action.Create()
-			create.SetValue(e.curValue)
-			e.setRefs(seg, create.SetReferences)
+			action.SetActionType(msgs.CLIENTACTIONTYPE_CREATE)
 		case e.origRead && e.origWritten:
 			DebugLog(t.connection.inner.Logger, "vUUId", vUUId, "action", "rw")
-			action.SetReadwrite()
-			rw := action.Readwrite()
-			rw.SetVersion(e.root.version[:])
-			rw.SetValue(e.curValue)
-			e.setRefs(seg, rw.SetReferences)
+			action.SetActionType(msgs.CLIENTACTIONTYPE_READWRITE)
 		case e.origRead:
 			DebugLog(t.connection.inner.Logger, "vUUId", vUUId, "action", "read")
-			action.SetRead()
-			action.Read().SetVersion(e.root.version[:])
+			action.SetActionType(msgs.CLIENTACTIONTYPE_READONLY)
+			setMod = false
 		case e.origWritten:
 			DebugLog(t.connection.inner.Logger, "vUUId", vUUId, "action", "wrote")
-			action.SetWrite()
-			write := action.Write()
-			write.SetValue(e.curValue)
-			e.setRefs(seg, write.SetReferences)
+			action.SetActionType(msgs.CLIENTACTIONTYPE_WRITEONLY)
 		default:
 			panic(fmt.Sprintf("Effect appears to be a noop! %v %#v", vUUId, e))
+		}
+		if setMod {
+			action.SetModified()
+			mod := action.Modified()
+			mod.SetValue(e.curValue)
+			e.setRefs(seg, mod.SetReferences)
+		} else {
+			action.SetUnmodified()
 		}
 	}
 	DebugLog(t.connection.inner.Logger, "debug", "submitting")
@@ -446,9 +445,8 @@ func (t *Transaction) load(vUUId *common.VarUUId) (vr *valueRef, modifiedVars []
 	cTxn.SetActions(actions)
 	action := actions.At(0)
 	action.SetVarId(vUUId[:])
-	action.SetRead()
-	read := action.Read()
-	read.SetVersion(common.VersionZero[:])
+	action.SetActionType(msgs.CLIENTACTIONTYPE_READONLY)
+	action.SetUnmodified()
 	outcome, modifiedVars, err := t.connection.submitTransaction(&cTxn)
 	if err != nil {
 		return
