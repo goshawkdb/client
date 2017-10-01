@@ -375,9 +375,9 @@ func (tcc *tlsCapnpClient) createReader() {
 }
 
 func (tcc *tlsCapnpClient) InternalShutdown() {
+	tcc.tlsCapnpHandshaker.InternalShutdown()
 	if tcc.reader != nil {
 		tcc.reader.Stop()
 		tcc.reader = nil
 	}
-	tcc.tlsCapnpHandshaker.InternalShutdown()
 }
