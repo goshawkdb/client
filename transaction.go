@@ -452,7 +452,9 @@ func (t *Transaction) load(vUUId *common.VarUUId) (vr *valueRef, modifiedVars []
 		return
 	}
 	if outcome.Which() != msgs.CLIENTTXNOUTCOME_ABORT {
-		panic(fmt.Sprintf("When loading %v, failed to get abort outcome!", vUUId))
+		origTxnId := common.MakeTxnId(outcome.Id())
+		finalTxnId := common.MakeTxnId(outcome.FinalId())
+		panic(fmt.Sprintf("%v (%v) When loading %v, failed to get abort outcome! %v", finalTxnId, origTxnId, vUUId, outcome.Which()))
 	}
 	vr = t.rootCache.Get(vUUId)
 	return

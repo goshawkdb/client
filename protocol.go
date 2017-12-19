@@ -362,7 +362,7 @@ func (tcc *tlsCapnpClient) Run() error {
 	seg := capn.NewBuffer(nil)
 	message := msgs.NewRootClientMessage(seg)
 	message.SetHeartbeat()
-	tcc.CreateBeater(tcc.actor, common.SegToBytes(seg))
+	tcc.CreateBeater(tcc.actor, common.SegToBytes(seg), false)
 	tcc.createReader()
 	return nil
 }

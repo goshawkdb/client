@@ -270,9 +270,11 @@ func (msg *connectionMsgTxnOutcome) Exec() (bool, error) {
 	var modifiedVars []*common.VarUUId
 	switch outcome.Which() {
 	case msgs.CLIENTTXNOUTCOME_COMMIT:
+		DebugLog(c.inner.Logger, "debug", "committed", "TxnId", txnId, "FinalTxnId", finalTxnId)
 		c.committedCount++
 		c.cache.updateFromTxnCommit(c.txnMsg.txn)
 	case msgs.CLIENTTXNOUTCOME_ABORT:
+		DebugLog(c.inner.Logger, "debug", "aborted", "TxnId", txnId, "FinalTxnId", finalTxnId)
 		c.restartedCount++
 		updates := outcome.Abort()
 		modifiedVars = c.cache.updateFromTxnAbort(&updates)

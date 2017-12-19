@@ -49,6 +49,9 @@ func (c *cache) updateFromTxnCommit(txn *msgs.ClientTxn) {
 		vUUId := common.MakeVarUUId(action.VarId())
 		switch action.ActionType() {
 		case msgs.CLIENTACTIONTYPE_CREATE, msgs.CLIENTACTIONTYPE_WRITEONLY, msgs.CLIENTACTIONTYPE_READWRITE:
+			if action.Which() != msgs.CLIENTACTION_MODIFIED {
+				panic("WRITEONLY should have CLIENTACTION_MODIFIED")
+			}
 			mod := action.Modified()
 			refs := mod.References()
 			isCreate := action.ActionType() == msgs.CLIENTACTIONTYPE_CREATE
@@ -78,6 +81,9 @@ func (c *cache) updateFromTxnAbort(actions *msgs.ClientAction_List) []*common.Va
 			// We're missing TxnId and TxnId made a write of vUUId (to
 			// version TxnId). Though we don't actually have txnId any
 			// more...
+			if action.Which() != msgs.CLIENTACTION_MODIFIED {
+				panic("WRITEONLY should have CLIENTACTION_MODIFIED")
+			}
 			mod := action.Modified()
 			refs := mod.References()
 			if c.updateFromWrite(vUUId, mod.Value(), &refs, false) {
