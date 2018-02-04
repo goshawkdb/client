@@ -89,56 +89,11 @@ func (t *Transaction) RestartNeeded() bool {
 	return t.restartNeeded
 }
 
-func (t *Transaction) Retry() (err error) {
-	t.lock.Lock()
-	defer t.lock.Unlock()
-	if err = t.valid(); err != nil {
-		return
-	}
-	reads := make(map[common.VarUUId]bool)
-	for cur := t; cur != nil; cur = cur.parent {
-		for vUUId, e := range cur.effects {
-			if e.origRead {
-				reads[vUUId] = true
-			}
-		}
-	}
-	DebugLog(t.connection.inner.Logger, "debug", "retry", "reads", reads)
-	if len(reads) == 0 {
-		return noReads
-	}
-
-	seg := capn.NewBuffer(nil)
-	cTxn := msgs.NewClientTxn(seg)
-	cTxn.SetRetry(true)
-	actions := msgs.NewClientActionList(seg, len(reads))
-	cTxn.SetActions(actions)
-	idx := 0
-	for vUUId := range reads {
-		action := actions.At(idx)
-		action.SetVarId(vUUId[:])
-		action.SetUnmodified()
-		action.SetActionType(msgs.CLIENTACTIONTYPE_READONLY)
-		idx++
-	}
-	outcome, modifiedVars, err := t.connection.submitTransaction(&cTxn)
-	if err != nil {
-		return err
-	}
-	if outcome.Which() != msgs.CLIENTTXNOUTCOME_ABORT {
-		panic("When retrying, failed to get abort outcome!")
-	}
-	t.determineRestart(modifiedVars)
-
-	return
-}
-
 var (
 	noReadCap     = errors.New("No capability to read.")
 	noWriteCap    = errors.New("No capability to write.")
 	aborted       = errors.New("Transaction has been aborted.")
 	restartNeeded = errors.New("Restart needed.")
-	noReads       = errors.New("Cannot retry: transaction never made any reads.")
 	childExists   = errors.New("Illegal attempt to access parent transaction whilst child exists.")
 )
 
@@ -355,7 +310,6 @@ func (t *Transaction) commitToServer() (err error) {
 
 	seg := capn.NewBuffer(nil)
 	cTxn := msgs.NewClientTxn(seg)
-	cTxn.SetRetry(false)
 	actions := msgs.NewClientActionList(seg, len(t.effects))
 	cTxn.SetActions(actions)
 	idx := 0
@@ -365,31 +319,25 @@ func (t *Transaction) commitToServer() (err error) {
 		action := actions.At(idx)
 		idx++
 		action.SetVarId(vUUId[:])
-		setMod := true
-		switch {
-		case e.root == nil:
-			DebugLog(t.connection.inner.Logger, "vUUId", vUUId, "action", "created")
-			action.SetActionType(msgs.CLIENTACTIONTYPE_CREATE)
-		case e.origRead && e.origWritten:
-			DebugLog(t.connection.inner.Logger, "vUUId", vUUId, "action", "rw")
-			action.SetActionType(msgs.CLIENTACTIONTYPE_READWRITE)
-		case e.origRead:
-			DebugLog(t.connection.inner.Logger, "vUUId", vUUId, "action", "read")
-			action.SetActionType(msgs.CLIENTACTIONTYPE_READONLY)
-			setMod = false
-		case e.origWritten:
-			DebugLog(t.connection.inner.Logger, "vUUId", vUUId, "action", "wrote")
-			action.SetActionType(msgs.CLIENTACTIONTYPE_WRITEONLY)
-		default:
-			panic(fmt.Sprintf("Effect appears to be a noop! %v %#v", vUUId, e))
-		}
-		if setMod {
-			action.SetModified()
-			mod := action.Modified()
-			mod.SetValue(e.curValue)
-			e.setRefs(seg, mod.SetReferences)
+		value := action.Value()
+		if e.root == nil {
+			value.SetCreate()
+			create := value.Create()
+			create.SetValue(e.curValue)
+			e.setRefs(seg, create.SetReferences)
 		} else {
-			action.SetUnmodified()
+			value.SetExisting()
+			existing := value.Existing()
+			existing.SetRead(e.origRead)
+			modify := existing.Modify()
+			if e.origWritten {
+				modify.SetWrite()
+				write := modify.Write()
+				write.SetValue(e.curValue)
+				e.setRefs(seg, write.SetReferences)
+			} else {
+				modify.SetNot()
+			}
 		}
 	}
 	DebugLog(t.connection.inner.Logger, "debug", "submitting")
@@ -445,8 +393,9 @@ func (t *Transaction) load(vUUId *common.VarUUId) (vr *valueRef, modifiedVars []
 	cTxn.SetActions(actions)
 	action := actions.At(0)
 	action.SetVarId(vUUId[:])
-	action.SetActionType(msgs.CLIENTACTIONTYPE_READONLY)
-	action.SetUnmodified()
+	value := action.Value()
+	value.SetExisting()
+	value.Existing().SetRead(true)
 	outcome, modifiedVars, err := t.connection.submitTransaction(&cTxn)
 	if err != nil {
 		return

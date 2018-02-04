@@ -47,19 +47,21 @@ func (c *cache) updateFromTxnCommit(txn *msgs.ClientTxn) {
 	for idx, l := 0, actions.Len(); idx < l; idx++ {
 		action := actions.At(idx)
 		vUUId := common.MakeVarUUId(action.VarId())
-		switch action.ActionType() {
-		case msgs.CLIENTACTIONTYPE_CREATE, msgs.CLIENTACTIONTYPE_WRITEONLY, msgs.CLIENTACTIONTYPE_READWRITE:
-			if action.Which() != msgs.CLIENTACTION_MODIFIED {
-				panic("WRITEONLY should have CLIENTACTION_MODIFIED")
+		value := action.Value()
+		switch value.Which() {
+		case msgs.CLIENTACTIONVALUE_CREATE:
+			create := value.Create()
+			refs := create.References()
+			c.updateFromWrite(vUUId, create.Value(), &refs, true)
+		case msgs.CLIENTACTIONVALUE_EXISTING:
+			modify := value.Existing().Modify()
+			if modify.Which() == msgs.CLIENTACTIONVALUEEXISTINGMODIFY_WRITE {
+				write := modify.Write()
+				refs := write.References()
+				c.updateFromWrite(vUUId, write.Value(), &refs, false)
 			}
-			mod := action.Modified()
-			refs := mod.References()
-			isCreate := action.ActionType() == msgs.CLIENTACTIONTYPE_CREATE
-			c.updateFromWrite(vUUId, mod.Value(), &refs, isCreate)
-		case msgs.CLIENTACTIONTYPE_READONLY:
-			// do nothing
 		default:
-			panic(fmt.Sprintf("Unexpected action! %v", action.Which()))
+			panic(fmt.Sprintf("Unexpected value action! %v", value.Which()))
 		}
 	}
 }
@@ -73,24 +75,26 @@ func (c *cache) updateFromTxnAbort(actions *msgs.ClientAction_List) []*common.Va
 		action := actions.At(idx)
 		vUUId := common.MakeVarUUId(action.VarId())
 		DebugLog(c.logger, "debug", "abort", "vUUId", vUUId)
-		switch action.ActionType() {
-		case msgs.CLIENTACTIONTYPE_DELETE:
+		value := action.Value()
+		switch value.Which() {
+		case msgs.CLIENTACTIONVALUE_MISSING:
 			c.updateFromDelete(vUUId)
 			modifiedVars = append(modifiedVars, vUUId)
-		case msgs.CLIENTACTIONTYPE_WRITEONLY:
+		case msgs.CLIENTACTIONVALUE_EXISTING:
 			// We're missing TxnId and TxnId made a write of vUUId (to
 			// version TxnId). Though we don't actually have txnId any
 			// more...
-			if action.Which() != msgs.CLIENTACTION_MODIFIED {
-				panic("WRITEONLY should have CLIENTACTION_MODIFIED")
+			modify := value.Existing().Modify()
+			if modify.Which() != msgs.CLIENTACTIONVALUEEXISTINGMODIFY_WRITE {
+				panic("EXISTING update should have CLIENTACTIONVALUEEXISTINGMODIFY_WRITE")
 			}
-			mod := action.Modified()
-			refs := mod.References()
-			if c.updateFromWrite(vUUId, mod.Value(), &refs, false) {
+			write := modify.Write()
+			refs := write.References()
+			if c.updateFromWrite(vUUId, write.Value(), &refs, false) {
 				modifiedVars = append(modifiedVars, vUUId)
 			}
 		default:
-			panic(fmt.Sprint("Received update that was neither a read or write action:", action.Which()))
+			panic(fmt.Sprint("Received update with illegal value action:", value.Which()))
 		}
 	}
 	DebugLog(c.logger, "debug", "updating from abort...done")
