@@ -250,8 +250,9 @@ func (msg *connectionMsgTxnOutcome) Exec() (bool, error) {
 	c := msg.c
 	outcome := msg.outcome
 	txnId := common.MakeTxnId(outcome.Id())
-	if c.txnMsg == nil {
-		panic(fmt.Sprintf("Received txn outcome for unknown txn: %v", txnId))
+	if c.txnMsg == nil || binary.BigEndian.Uint64(txnId[:8]) < c.nextTxnId {
+		fmt.Printf("Received txn outcome for unknown txn: %v\n", txnId)
+		return false, nil
 	}
 
 	finalTxnId := common.MakeTxnId(outcome.FinalId())

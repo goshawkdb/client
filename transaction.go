@@ -144,6 +144,37 @@ func (t *Transaction) Read(ref RefCap) (value []byte, refs []RefCap, err error) 
 	return
 }
 
+func (t *Transaction) Subscribe(ref RefCap) (err error) {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+	if err = t.valid(); err != nil {
+		return
+	}
+	e := t.find(ref.vUUId, true)
+	if e.root != nil && !e.root.capability.CanRead() {
+		return noReadCap
+	}
+
+	if e.curRefs == nil { // we need to load it
+		vr, modifiedVars, err := t.load(ref.vUUId)
+		if err != nil {
+			return err
+		}
+		e.curValue = vr.value
+		e.curRefs = vr.references
+		t.determineRestart(modifiedVars)
+		if t.restartNeeded {
+			return nil
+		}
+	}
+
+	t.effects[*ref.vUUId] = e
+	// we read the original if we haven't written it yet, and we didn't create it
+	e.origRead = e.origRead || (!e.origWritten && e.root != nil)
+	e.subscribe = true
+	return
+}
+
 func (t *Transaction) ObjectCapability(ref RefCap) (common.Capability, error) {
 	t.lock.Lock()
 	defer t.lock.Unlock()
@@ -212,6 +243,7 @@ type effect struct {
 	curRefs     []RefCap
 	origRead    bool
 	origWritten bool
+	subscribe   bool
 }
 
 func (e *effect) clone() *effect {
@@ -296,6 +328,7 @@ func (t *Transaction) commitToParent() {
 			pe.curRefs = e.curRefs
 			pe.origRead = pe.origRead || e.origRead
 			pe.origWritten = pe.origWritten || e.origWritten
+			pe.subscribe = pe.subscribe || e.subscribe
 		} else {
 			p.effects[vUUId] = e
 		}
@@ -339,6 +372,8 @@ func (t *Transaction) commitToServer() (err error) {
 				modify.SetNot()
 			}
 		}
+		meta := action.Meta()
+		meta.SetAddSub(e.subscribe)
 	}
 	DebugLog(t.connection.inner.Logger, "debug", "submitting")
 
